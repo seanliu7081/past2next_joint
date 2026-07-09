@@ -48,7 +48,7 @@ env_runner:
 
 
 dataset:
-  _target_: oat.dataset.zarr_dataset_with_past.ZarrDatasetWithPastAction
+  _target_: oat.dataset.lazy_zarr_dataset_with_past.LazyZarrDatasetWithPastAction
   zarr_path: data/libero/libero10_N${training.num_demo}.zarr
   obs_keys:
     - agentview_rgb

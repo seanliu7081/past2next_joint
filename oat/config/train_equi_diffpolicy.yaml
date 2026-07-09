@@ -1,8 +1,8 @@
 defaults:
   - _self_
-  - task/policy: libero/libero10_with_past
+  - task/policy: libero/libero10
 
-name: train_oatpolicy_with_enriched_past
+name: train_equi_diffpolicy
 _target_: oat.workspace.train_policy.TrainPolicyWorkspace
 
 seed: 42
@@ -11,17 +11,16 @@ horizon: 16
 # n_action_steps: 16
 n_action_steps: 8
 n_obs_steps: 2
-past_n: 7
 task_name: ${task.policy.name}
 shape_meta: ${task.policy.shape_meta}
 
 policy:
-  _target_: oat.policy.oat_policy_with_enriched_past.OATPolicyWithEnrichedPast
+  _target_: oat.policy.equi_diffpolicy.EquiDiffusionTransformerPolicy
 
   shape_meta: ${shape_meta}
+  horizon: ${horizon}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
-  past_n: ${past_n}
 
   obs_encoder:
     _target_: oat.perception.fused_obs_encoder.FusedObservationEncoder
@@ -34,20 +33,37 @@ policy:
 
     state_encoder:
       _target_: oat.perception.state_encoder.ProjectionStateEncoder
-      out_dim: null
-
-  action_tokenizer:
-    _target_: oat.tokenizer.oat.tokenizer.OATTok.from_checkpoint
-    checkpoint: ???
+      out_dim: null   # identity projection
 
   # backbone model params
   embed_dim: 256
   n_layers: 4
   n_heads: 4
   dropout: 0.1
-  # policy inference params
-  temperature: 1.0
-  topk: 10
+
+  # structured (block-isotropic) diffusion source; default-off == torch.randn.
+  # ranges for physical_so2 are auto-derived from the fitted action normalizer.
+  equi_noise:
+    enable: true
+    mode: physical_so2          # "normalized" | "physical_so2"
+    world_frame_rotation: false  # keep false unless rotation delta is world-frame
+    scales: null                 # optional dict: {xy, z, rot, rot_xy, rot_z, grip}
+    ranges: null                 # physical_so2: null -> derive from action normalizer
+
+  # DDIM
+  num_inference_steps: 10
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100  # train with 100 steps, inferece with 10 steps
+    beta_start: 0.0001
+    beta_end: 0.02
+    # beta_schedule is important
+    # this is the best we found
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
 
 training:
   resume: True
@@ -56,11 +72,10 @@ training:
   num_epochs: 5001
   val_every: 10
   sample_every: 10
-  # rollout_every: 200
-  rollout_every: 100
+  rollout_every: 200
   checkpoint_every: 10
   lr_scheduler: constant
-  lr_warmup_steps: 100
+  lr_warmup_steps: 200
   gradient_accumulate_every: 1
   max_train_steps: null
   max_val_steps: null
@@ -85,16 +100,16 @@ optimizer:
   betas: [0.9, 0.95]
 
 dataloader:
-  batch_size: 64
-  num_workers: 2
+  batch_size: 256
+  num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True
   drop_last: True
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 2
+  batch_size: 256
+  num_workers: 4
   shuffle: False
   pin_memory: True
   persistent_workers: True
@@ -114,7 +129,7 @@ checkpoint:
     monitor_key: mean_success_rate
     mode: max
     k: 3
-    format_str: "ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt"
+    format_str: 'ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 

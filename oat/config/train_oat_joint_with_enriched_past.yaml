@@ -2,8 +2,8 @@ defaults:
   - _self_
   - task/policy: libero/libero10_with_past
 
-name: train_oatpolicy_with_enriched_past
-_target_: oat.workspace.train_policy.TrainPolicyWorkspace
+name: train_oat_joint_with_enriched_past
+_target_: oat.workspace.train_oat_joint.TrainOATJointWorkspace
 
 seed: 42
 # horizon: 32
@@ -14,9 +14,12 @@ n_obs_steps: 2
 past_n: 7
 task_name: ${task.policy.name}
 shape_meta: ${task.policy.shape_meta}
+action_dim: ${task.policy.shape_meta.action.shape[0]}
+
+latent_dim: ${eval:'len(${policy.action_tokenizer.quantizer.levels})'}
 
 policy:
-  _target_: oat.policy.oat_policy_with_enriched_past.OATPolicyWithEnrichedPast
+  _target_: oat.policy.oat_policy_with_enriched_past_joint.OATPolicyWithEnrichedPastJoint
 
   shape_meta: ${shape_meta}
   n_action_steps: ${n_action_steps}
@@ -34,11 +37,40 @@ policy:
 
     state_encoder:
       _target_: oat.perception.state_encoder.ProjectionStateEncoder
-      out_dim: null
+      out_dim: null   # identity projection
 
+  # trainable action tokenizer (built from scratch, NOT from_checkpoint)
   action_tokenizer:
-    _target_: oat.tokenizer.oat.tokenizer.OATTok.from_checkpoint
-    checkpoint: ???
+    _target_: oat.tokenizer.oat.tokenizer.OATTok
+
+    encoder:
+      _target_: oat.tokenizer.oat.encoder.register_encoder.RegisterEncoder
+      sample_dim: ${action_dim}
+      sample_horizon: ${horizon}
+      emb_dim: 256
+      head_dim: 64
+      depth: 2
+      pdropout: 0.1
+      latent_dim: ${latent_dim}
+      num_registers: 8
+
+    decoder:
+      _target_: oat.tokenizer.oat.decoder.single_pass_decoder.SinglePassDecoder
+      sample_dim: ${action_dim}
+      sample_horizon: ${horizon}
+      emb_dim: 256
+      head_dim: 64
+      depth: 4
+      pdropout: 0.1
+      token_dropout_mode: 'pow2'
+      latent_dim: ${latent_dim}
+      latent_horizon: ${policy.action_tokenizer.encoder.num_registers}
+      use_causal_decoder: true
+
+    quantizer:
+      _target_: oat.tokenizer.oat.quantizer.fsq.FSQ
+      # levels: [8, 5, 5, 5]
+      levels: [8, 5, 5, 5, 5]
 
   # backbone model params
   embed_dim: 256
@@ -48,12 +80,16 @@ policy:
   # policy inference params
   temperature: 1.0
   topk: 10
+  # joint training loss weights
+  recon_loss_weight: 1.0
+  ce_loss_weight: 1.0
 
 training:
   resume: True
   allow_bf16: True
   max_grad_norm: 1.0
   num_epochs: 5001
+  tokenizer_warmup_epochs: 50   # train tokenizer only for first K epochs, then joint (0 disables)
   val_every: 10
   sample_every: 10
   # rollout_every: 200
@@ -81,6 +117,7 @@ ema:
 optimizer:
   policy_lr: 5.0e-5
   obs_enc_lr: 1.0e-5
+  tokenizer_lr: 5.0e-5
   weight_decay: 0.0
   betas: [0.9, 0.95]
 
@@ -114,7 +151,7 @@ checkpoint:
     monitor_key: mean_success_rate
     mode: max
     k: 3
-    format_str: "ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt"
+    format_str: 'ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 
