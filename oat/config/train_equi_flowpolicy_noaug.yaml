@@ -1,0 +1,12 @@
+# Arm: augmentation OFF, full fine-tune. Per plan decision D1 this arm still
+# reads its angle-0 images from the aug zarr (image_source: aug, inherited) so
+# aug-on vs aug-off compares identical render provenance. For a smoke run
+# before the aug zarr exists, override on the CLI: aug.image_source=base
+defaults:
+  - train_equi_flowpolicy
+  - _self_
+
+name: train_eqflow_noaug_fullft
+
+aug:
+  enable: false

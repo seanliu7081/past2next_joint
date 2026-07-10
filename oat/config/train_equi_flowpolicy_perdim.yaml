@@ -1,0 +1,15 @@
+# Ablation: per-dim min-max normalization (today's fitted stats, frozen) with
+# the physical_so2 warp correction on the noise source.
+defaults:
+  - train_equi_flowpolicy
+  - _self_
+
+name: train_eqflow_perdim
+
+norm:
+  mode: per_dim_minmax
+  spec_path: data/libero/norm_spec_per_dim_minmax_libero10_N500.json
+
+policy:
+  source:
+    warp_correction: physical_so2

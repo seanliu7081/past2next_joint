@@ -1,0 +1,9 @@
+# Arm: augmentation ON, obs encoder frozen.
+defaults:
+  - train_equi_flowpolicy
+  - _self_
+
+name: train_eqflow_aug_frozen
+
+policy:
+  freeze_obs_encoder: true

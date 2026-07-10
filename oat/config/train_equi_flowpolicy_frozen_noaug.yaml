@@ -1,0 +1,15 @@
+# Arm: augmentation OFF, obs encoder frozen. Per plan decision D1 this arm
+# still reads its angle-0 images from the aug zarr (image_source: aug,
+# inherited) so aug-on vs aug-off compares identical render provenance. For a
+# smoke run before the aug zarr exists, override: aug.image_source=base
+defaults:
+  - train_equi_flowpolicy
+  - _self_
+
+name: train_eqflow_noaug_frozen
+
+aug:
+  enable: false
+
+policy:
+  freeze_obs_encoder: true
