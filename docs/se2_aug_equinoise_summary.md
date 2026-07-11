@@ -123,14 +123,47 @@ world-frame (gated by probe 1); `eef_pos` xy about `p_base`; `eef_quat ← q_{R_
 (k=0 when `augment=False`), so `len(dataset)` and steps/epoch are byte-identical with aug
 on or off — the aug-vs-no-aug comparison is matched-compute by construction.
 
-Pre-render the augmented image cache (once; ~34 GB, resumable, shardable with `--tasks`):
+**Generate the augmented dataset** (`scripts/prerender_se2_aug.py`, once; ~34 GB,
+resumable, shardable). This is the command that produces `libero10_N500_se2aug.zarr`
+from the base zarr + LIBERO HDF5 states — all flags shown with their defaults:
 
 ```bash
 MUJOCO_GL=egl python scripts/prerender_se2_aug.py \
-  --base_zarr data/libero/libero10_N500.zarr \
-  --hdf5_dir  third_party/LIBERO/libero/datasets/libero_10 \
-  --out       data/libero/libero10_N500_se2aug.zarr --resume
+  --base_zarr    data/libero/libero10_N500.zarr \
+  --hdf5_dir     third_party/LIBERO/libero/datasets/libero_10 \
+  --out          data/libero/libero10_N500_se2aug.zarr \
+  --angles       0,10,-10,20,-20,30,-30 \
+  --tasks        all \
+  --image_size   128 \
+  --xy_margin    0.05 \
+  --joint_margin 0.05 \
+  --resume
 ```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--base_zarr` | `data/libero/libero10_N500.zarr` | base (unaugmented) zarr; numerics stay here, only images are re-rendered |
+| `--hdf5_dir` | `third_party/LIBERO/libero/datasets/libero_10` | LIBERO `*_demo.hdf5` files (per-demo flattened MuJoCo states) |
+| `--out` | `data/libero/libero10_N500_se2aug.zarr` | augmentation zarr to write |
+| `--angles` | `0,10,-10,20,-20,30,-30` | comma-separated yaw angles in **degrees**; must include 0 (auto-reordered first) |
+| `--tasks` | `all` | `all` or comma-separated task names — the **shard unit** |
+| `--resume` / `--no-resume` | resume | skip `(episode, angle)` pairs already in `meta/done_mask`; `--no-resume` **wipes** `--out` first |
+| `--image_size` | `128` | rendered camera resolution (must match the base zarr) |
+| `--preview_dir` | `None` | optional dir for one agentview PNG per `(task, angle)` (sanity check) |
+| `--no-support-check` | (on) | disable the post-rewrite support-contact validity check |
+| `--xy_margin` | `0.05` | inset (m) from the table edge; rotated object centers must stay inside the table-top xy AABB shrunk by this margin |
+| `--joint_margin` | `0.05` | joint-1 limit margin (rad) |
+
+Shard across processes by task (start shards only after one run has created `--out`):
+
+```bash
+MUJOCO_GL=egl python scripts/prerender_se2_aug.py --tasks LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato --resume
+```
+
+Outputs: the aug zarr
+(`images/{agentview_rgb,robot0_eye_in_hand_rgb}/angle_00..NN`,
+`meta/{angles_deg, episode_ends, valid_mask, done_mask, p_base, state_offset}`)
+plus a validity report `<out>.report.json` (or `<out>.report.<shard_tag>.json` per shard).
 
 > Coverage note: 6 of 10 tasks have goals anchored to **non-rotating fixtures**
 > (stove / cabinet / microwave / caddy / table-plate regions). Those scenes correctly
@@ -159,24 +192,30 @@ protocol + `Level1ScaleHeadSource` stub) but not wired into training.
 
 ## 3. Train & eval commands
 
-Five arms (Hydra composes each from `train_equi_flowpolicy.yaml`):
+Five arms (Hydra composes each from `train_equi_flowpolicy.yaml`). All launch through the
+**same command** — 2-process DDP via `torchrun`, EGL offscreen rendering (required now that
+training rolls out in-loop, see **Evaluation**), and the two shared overrides
+`training.num_demo=500 task.policy.lazy_eval=false`. Canonical arm (aug ON, full fine-tune):
 
 ```bash
-# aug ON,  full fine-tune          (group-compatible norm, block-isotropic source)
-python scripts/run_workspace.py --config-name=train_equi_flowpolicy
-
-# aug OFF, full fine-tune          (matched budget; still reads angle-0 aug renders)
-python scripts/run_workspace.py --config-name=train_equi_flowpolicy_noaug
-
-# aug ON,  frozen obs encoder
-python scripts/run_workspace.py --config-name=train_equi_flowpolicy_frozen
-
-# aug OFF, frozen obs encoder
-python scripts/run_workspace.py --config-name=train_equi_flowpolicy_frozen_noaug
-
-# ablation: per-dim min-max norm + physical_so2 source (aug on/off via override)
-python scripts/run_workspace.py --config-name=train_equi_flowpolicy_perdim aug.enable=true
+HYDRA_FULL_ERROR=1 MUJOCO_EGL_DEVICE_ID=0 MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=0 \
+  torchrun --nproc_per_node=2 scripts/run_workspace.py \
+  --config-name=train_equi_flowpolicy \
+  training.num_demo=500 task.policy.lazy_eval=false
 ```
+
+The other four arms use the **same launcher** — swap only `--config-name` (the per-dim
+ablation additionally passes `aug.enable=true`):
+
+```bash
+--config-name=train_equi_flowpolicy_noaug          # aug OFF, full fine-tune (matched budget; still reads angle-0 renders)
+--config-name=train_equi_flowpolicy_frozen         # aug ON,  frozen obs encoder
+--config-name=train_equi_flowpolicy_frozen_noaug   # aug OFF, frozen obs encoder
+--config-name=train_equi_flowpolicy_perdim aug.enable=true   # ablation: per-dim min-max norm + physical_so2 source
+```
+
+> Scale `--nproc_per_node` and `CUDA_VISIBLE_DEVICES` to your GPUs (the command above is
+> 2 ranks on GPU 0); `HYDRA_FULL_ERROR=1` surfaces full Hydra tracebacks.
 
 Smoke test any arm (short, offline, no rollout):
 
@@ -191,9 +230,13 @@ Inspect a composed config without running:
 python scripts/run_workspace.py --config-name=train_equi_flowpolicy --cfg job
 ```
 
-**Evaluation** (rollout success rate). `lazy_eval: true` for libero10, so training does no
-in-loop rollout — evaluate checkpoints afterward with the standalone script (it rebuilds
-the env runner from the checkpoint's own config):
+**Evaluation** (rollout success rate). The train commands above set
+`task.policy.lazy_eval=false`, so training now runs **in-loop rollout** every
+`training.rollout_every` steps (100 for the flow arms) and logs `mean_success_rate`, which
+drives top-k checkpoint selection — this is why the launcher needs EGL
+(`MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0`). (Leaving the config default `lazy_eval: true`
+disables in-loop rollout instead.) To (re-)evaluate a checkpoint standalone — it rebuilds
+the env runner from the checkpoint's own config:
 
 ```bash
 MUJOCO_GL=egl python scripts/eval_policy_sim.py \
