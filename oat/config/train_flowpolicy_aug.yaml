@@ -1,0 +1,14 @@
+# Arm: SE(2) augmentation ON, EquiNoise OFF, full fine-tune. Same data
+# pipeline, task, and frozen normalization spec as train_equi_flowpolicy; the
+# policy is a plain FlowPolicy (pure randn source at both the training
+# interpolation and the inference Euler seed). AugFlowPolicy raises if a source
+# config arrives enabled, so policy.source is nulled out here explicitly.
+defaults:
+  - train_equi_flowpolicy
+  - _self_
+
+name: train_flow_aug_fullft
+
+policy:
+  _target_: oat.policy.aug_flow_policy.AugFlowPolicy
+  source: null
