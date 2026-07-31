@@ -161,12 +161,18 @@ def scene_extent_of(views) -> float:
 def init_from_depth(bundle: CaptureBundle,
                     component_geom_ids: Optional[Sequence[int]],
                     voxel_m: float,
-                    max_views: Optional[int] = None
+                    max_views: Optional[int] = None,
+                    view_indices: Optional[Sequence[int]] = None
                     ) -> Dict[str, torch.Tensor]:
     """Depth-based init (plan §5.2, skip SfM): backproject stride-4 pixels of
     every view (K + metric depth + c2w from the bundle), seg-filter to the
     component's geom ids (None = every rendered geom, the background case),
     voxel-downsample, and build the initial parameter tensors.
+
+    ``view_indices`` restricts the init to those views of the bundle (applied
+    BEFORE ``max_views`` subsampling); default None = all views (backward
+    compatible). ``fit_static`` passes its TRAINING split — held-out views
+    must not leak into the init, or the held-out metrics are biased.
 
     Robot-masked pixels (``view.mask``) are always excluded. Returns CPU
     float32 tensors: means (world frame), identity quats,
@@ -175,6 +181,9 @@ def init_from_depth(bundle: CaptureBundle,
     degree 3 (K=15).
     """
     views = list(bundle.views)
+    if view_indices is not None:
+        views = [views[int(i)] for i in view_indices]
+        assert views, "init_from_depth: empty view_indices"
     if max_views is not None and len(views) > int(max_views):
         sel = np.round(np.linspace(0, len(views) - 1, int(max_views))).astype(int)
         views = [views[i] for i in sel]
@@ -347,8 +356,12 @@ def fit_static(bundle: CaptureBundle, component: str, out_path: str,
     assert holdout, f"no held-out views with component pixels ({bundle.directory})"
 
     # ── init + parameters (strategy naming: means/quats/scales/opacities) ──
+    # init sees ONLY the training split: held-out views must not leak into
+    # the depth init (they seed means/colors — the held-out metrics would be
+    # evaluated on views that shaped the model).
     init = init_from_depth(bundle, gids, voxel_m,
-                           max_views=cfg["max_init_views"])
+                           max_views=cfg["max_init_views"],
+                           view_indices=train)
     params = torch.nn.ParameterDict({
         "means": torch.nn.Parameter(init["means"].to(dev)),
         "quats": torch.nn.Parameter(init["quats"].to(dev)),

@@ -24,7 +24,12 @@ from oat.gsaug.components import (
     quat_to_R,
 )
 from oat.gsaug.gaussian_asset import EXPECTED_CONVENTIONS, GaussianAsset
-from oat.gsaug.sh_rotation import rotate_sh_l1, rotate_sh_z, sh_degree_of
+from oat.gsaug.sh_rotation import (
+    rotate_sh_l1,
+    rotate_sh_so3,
+    rotate_sh_z,
+    sh_degree_of,
+)
 
 # ── tiny real-SH evaluator (numpy port of gsplat _eval_sh_bases_fast, l<=3) ──
 # Constants verbatim from gsplat/cuda/_torch_impl.py; layout: bands l=0..3,
@@ -164,6 +169,46 @@ def test_rotate_sh_l1_rejects_wrong_degree():
         rotate_sh_l1(rand_sh(2, 2, seed=8), np.eye(3))
 
 
+# ── rotate_sh_so3 (production general-SO(3) path, R7) ────────────────────────
+
+def test_rotate_sh_so3_matches_z_path_deg3():
+    # For a pure z-rotation the projection path must agree with the exact
+    # closed form at deg 3 — pins so3_deg3's two paths to each other.
+    sh = rand_sh(4, 3, seed=20)
+    theta = 1.234
+    out = rotate_sh_so3(sh, rodrigues([0, 0, 1], theta))
+    torch.testing.assert_close(out, rotate_sh_z(sh, theta), rtol=0.0, atol=1e-5)
+
+
+def test_rotate_sh_so3_band1_matches_l1():
+    # Band 1 under a random z-mixing R must reproduce the independently
+    # verified signed-permutation l=1 rule.
+    sh = rand_sh(5, 1, seed=21)
+    R = rodrigues([0.3, -0.5, 0.8], 1.1)
+    torch.testing.assert_close(rotate_sh_so3(sh, R), rotate_sh_l1(sh, R),
+                               rtol=0.0, atol=1e-6)
+
+
+def test_rotate_sh_so3_brute_force_deg3():
+    # f_rot(d) == f(R^T d) on the dense grid for a z-mixing R at deg 3: the
+    # projection is exact in the very basis the rasterizer evaluates (G5).
+    sh = rand_sh(3, 3, seed=22)
+    R = rodrigues([0.4, -0.7, 0.55], 1.3)   # mixes z with x/y
+    dirs = unit_dirs(seed=2)
+    f_rot = eval_sh(rotate_sh_so3(sh, R), dirs)
+    f_ref = eval_sh(sh, dirs @ R)
+    np.testing.assert_allclose(f_rot, f_ref, atol=1e-5)
+
+
+def test_rotate_sh_so3_composition():
+    sh = rand_sh(4, 3, seed=23)
+    R1 = rodrigues([0.3, -0.5, 0.8], 1.1)
+    R2 = rodrigues([-0.6, 0.2, 0.4], 0.7)
+    out = rotate_sh_so3(rotate_sh_so3(sh, R1), R2)
+    torch.testing.assert_close(out, rotate_sh_so3(sh, R2 @ R1),
+                               rtol=0.0, atol=1e-5)
+
+
 def test_sh_degree_of():
     assert sh_degree_of(rand_sh(1, 0)) == 0
     assert sh_degree_of(rand_sh(1, 3)) == 3
@@ -223,15 +268,44 @@ def make_component(mode, deg, n=5, seed=0):
     )
 
 
-def test_pure_z_assert_fires_on_tumbled_pose():
-    comp = make_component("z_only_deg3", 3)
-    q_tumble = aa_quat([1.0, 0.2, 0.0], 0.3)   # rotation with an x component
-    with pytest.raises(AssertionError, match="wigner"):
-        comp.posed(np.zeros(3), q_tumble)
+def test_tumbled_pose_rotates_sh_exactly():
+    # R7: on real demos objects tilt at reset and tumble when grasped, so a
+    # non-z delta must ROTATE the SH exactly — never assert, never pass SH
+    # through unrotated (G5).
+    comp = make_component("so3_deg3", 3)
+    axis, ang = [1.0, 0.2, 0.0], 0.3           # rotation with an x component
+    q_tumble = aa_quat(axis, ang)
+    p = np.array([0.05, -0.1, 0.2])
+    world = comp.posed(p, q_tumble)
+
+    Rt = torch.as_tensor(rodrigues(axis, ang), dtype=torch.float32)
+    want_means = comp.means_l @ Rt.T + torch.as_tensor(p, dtype=torch.float32)
+    torch.testing.assert_close(world.means, want_means, rtol=0.0, atol=1e-6)
+    q_t = torch.as_tensor(q_tumble, dtype=torch.float32)
+    want_quats = quat_normalize(
+        quat_mul(q_t.expand_as(comp.quats_l), comp.quats_l))
+    torch.testing.assert_close(world.quats, want_quats, rtol=0.0, atol=1e-6)
+    # q_capture is identity, so the delta IS q_tumble: SH must equal the
+    # exact SO(3) rotation of the local SH.
+    want_sh = rotate_sh_so3(comp.sh, quat_to_R(q_t))
+    torch.testing.assert_close(world.sh, want_sh, rtol=0.0, atol=1e-6)
+    assert not torch.allclose(world.sh, comp.sh)   # actually rotated
+
+
+def test_z_only_deg3_alias_maps_to_so3_deg3():
+    comp = make_component("z_only_deg3", 3)    # deprecated alias still constructs
+    assert comp.sh_rot_mode == "so3_deg3"
+    world = comp.posed(np.zeros(3), aa_quat([1.0, 0.2, 0.0], 0.3))  # no assert
+    torch.testing.assert_close(
+        world.sh,
+        rotate_sh_so3(comp.sh, quat_to_R(
+            torch.as_tensor(aa_quat([1.0, 0.2, 0.0], 0.3),
+                            dtype=torch.float32))),
+        rtol=0.0, atol=1e-6)
 
 
 def test_pure_z_pose_accepted_and_moves_means():
-    comp = make_component("z_only_deg3", 3)
+    comp = make_component("so3_deg3", 3)
     theta = math.radians(25.0)
     p = np.array([0.1, -0.2, 0.05])
     world = comp.posed(p, aa_quat([0, 0, 1], theta))
@@ -255,16 +329,6 @@ def test_static_background_rejects_nonidentity_pose():
     torch.testing.assert_close(world.means, comp.means_l)
 
 
-def test_z_only_sh_cache_returns_same_tensor():
-    comp = make_component("z_only_deg3", 3)
-    q = aa_quat([0, 0, 1], 0.4)
-    w1 = comp.posed(np.zeros(3), q)
-    w2 = comp.posed(np.array([0.3, 0.1, 0.0]), q)   # same theta, other position
-    assert w1.sh is w2.sh                            # cache hit: same object
-    w3 = comp.posed(np.zeros(3), aa_quat([0, 0, 1], 0.5))
-    assert w3.sh is not w1.sh                        # different theta: no hit
-
-
 def test_so3_deg1_requires_degree1():
     with pytest.raises(ValueError, match="degree 1"):
         make_component("so3_deg1", 3)
@@ -272,8 +336,8 @@ def test_so3_deg1_requires_degree1():
 
 def test_world_gaussians_concat_pads_sh():
     a = make_component("so3_deg1", 1).posed(np.zeros(3), [1.0, 0, 0, 0])
-    b = make_component("z_only_deg3", 3, seed=1).posed(np.zeros(3),
-                                                       [1.0, 0, 0, 0])
+    b = make_component("so3_deg3", 3, seed=1).posed(np.zeros(3),
+                                                    [1.0, 0, 0, 0])
     joint = WorldGaussians.concat([a, b])
     assert joint.sh.shape == (10, 16, 3) and joint.sh_degree == 3
     torch.testing.assert_close(joint.sh[:5, :4], a.sh)

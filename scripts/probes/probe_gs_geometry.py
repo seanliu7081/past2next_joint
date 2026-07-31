@@ -49,13 +49,15 @@ Orientation (G7, measured -- see data/libero/gs_render_facts.json):
   pins raw row 0 == OpenCV top, so projected (u, v) indexes the raw seg
   directly. EEF math and all oracle-vs-oracle comparisons therefore run in raw
   orientation with no flip.
-* ``GSCompositeRenderer`` transforms its output by the F2
-  ``gsplat_flip_ud`` fact; seg masks compared against GS outputs (IoU, wrist
-  mask) get the SAME facts-keyed transform, so GS-vs-seg comparisons stay
-  aligned with whatever compose does. A per-task orientation anchor (theta=0
-  GS agentview render vs the stored base frame, direct vs flipped MAD) is
-  recorded so a global-flip inconsistency in that chain is visible in the
-  report (the pre-render theta=0 MAD gate is what hard-fails on it).
+* ``GSCompositeRenderer`` ALREADY applies the F2 ``gsplat_flip_ud`` fact
+  internally (compose.render / render_component_alpha return DATASET-oriented
+  output), and raw seg masks are dataset-oriented too (F2b raw == stored) --
+  so GS-vs-seg comparisons need NO further flip, whatever F2 records; an
+  extra facts-keyed flip here would double-apply F2. A per-task orientation
+  anchor (theta=0 GS agentview render vs the stored base frame, direct vs
+  flipped MAD) is recorded so a global-flip inconsistency in that chain is
+  visible in the report (the pre-render theta=0 MAD gate is what hard-fails
+  on it).
 
 PASS = all three gates. Exit code 0 iff PASS. The output JSON is what
 ``SE2AugZarrDataset(expected_render_source='gs*')`` gates on (D7 pattern).
@@ -107,7 +109,6 @@ from oat.gsaug.capture import (
 )
 from oat.gsaug.cameras import (
     facts_flip,
-    facts_orientation_flip_ud,
     fovy_to_K,
     load_render_facts,
     mujoco_cam_to_w2c,
@@ -389,12 +390,18 @@ def main():
     # G7: measured conventions, asserted before anything renders
     facts = load_render_facts(facts_path)  # raises unless pass == true
     flip_mat = facts_flip(facts)
-    flip_ud = facts_orientation_flip_ud(facts)
 
     def to_gs_orientation(m: np.ndarray) -> np.ndarray:
-        """Align a raw-orientation array with GSCompositeRenderer output:
-        the SAME facts-keyed F2 transform compose applies (see docstring)."""
-        return m[::-1] if flip_ud else m
+        """Identity — raw-orientation seg masks are ALREADY aligned with
+        GSCompositeRenderer output. Measured chain (module docstring):
+        compose.render / render_component_alpha apply the F2 gsplat_flip_ud
+        flip INTERNALLY and return dataset-oriented frames, and raw seg ==
+        stored (dataset) orientation per F2b, so both sides of every GS-vs-seg
+        comparison share one orientation regardless of what F2 records.
+        Flipping by gsplat_flip_ud here would double-apply F2 and corrupt the
+        comparison whenever the fact records true. Kept as a marker for the
+        seg->GS comparison boundary."""
+        return m
 
     # ── GS aug zarr: sampling source (valid_mask) + delta (state_offset) ────
     gs_root = zarr.open(gs_zarr_path, mode="r")

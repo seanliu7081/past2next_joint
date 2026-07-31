@@ -10,8 +10,9 @@ Composition model (G1/G2):
     * background — world-frame Gaussians, identity-posed, SH never rotated
       (``sh_rot_mode='static'``);
     * one component per movable free joint — body-frame Gaussians posed by the
-      body's current ``data.xpos/xquat``, SH rotated by the closed-form
-      z-rotation (``'z_only_deg3'``, G5);
+      body's current ``data.xpos/xquat``, SH rotated exactly under the full
+      capture->current SO(3) delta (``'so3_deg3'``, G5: closed-form z fast
+      path, exact projection otherwise — real demos tilt and tumble, R7);
     * one component per robot link — link-frame Gaussians from the per-task
       robot asset split by ``link_id`` (G10), SH degree 1 rotated under full
       SO(3) (``'so3_deg1'``, G5).
@@ -61,8 +62,10 @@ def model_xml_sha1_of(env) -> str:
 
 @dataclass
 class _SceneBinding:
-    """Lazily-resolved ids for one live env's model (keyed by ``id(model)``)."""
-    model_id: int
+    """Lazily-resolved ids for one live env's model. The model OBJECT is held
+    and compared by identity (``is``) — an ``id()`` key without a reference
+    could be reused by a freed model and silently skip the G9 re-bind."""
+    model: object
     obj_body_ids: "OrderedDict[str, int]"    # free-joint name -> body id
     link_body_ids: "OrderedDict[str, int]"   # robot link (body) name -> body id
     cam_ids: "OrderedDict[str, int]"         # zarr image key -> camera id
@@ -141,9 +144,9 @@ class GSCompositeRenderer:
                     raise RuntimeError(
                         f"object asset '{joint_name}' meta lacks '{k}': a "
                         f"body-frame asset without its capture body pose "
-                        f"cannot drive the z-only SH delta (G5).")
+                        f"cannot drive the SH delta rotation (G5).")
             self._objects[joint_name] = PosedComponent.from_asset(
-                a, joint_name, "z_only_deg3", device=self.device)
+                a, joint_name, "so3_deg3", device=self.device)
 
         robot_asset = self._load_asset(assets["robot"], "robot",
                                        expected_frame="link")
@@ -264,7 +267,7 @@ class GSCompositeRenderer:
 
     def _bind_scene(self, env) -> _SceneBinding:
         model = env.sim.model
-        if self._binding is not None and self._binding.model_id == id(model):
+        if self._binding is not None and self._binding.model is model:
             return self._binding
 
         live = model_xml_sha1_of(env)
@@ -320,7 +323,7 @@ class GSCompositeRenderer:
                                device=self.device)
 
         self._binding = _SceneBinding(
-            model_id=id(model), obj_body_ids=obj_body_ids,
+            model=model, obj_body_ids=obj_body_ids,
             link_body_ids=link_body_ids, cam_ids=cam_ids, Ks=Ks_t)
         return self._binding
 

@@ -207,10 +207,26 @@ def make_renderer(env, image_size: int):
                            height=int(image_size), width=int(image_size))
 
 
-def scene_option_from_facts(facts: dict):
-    """``mujoco.MjvOption`` realizing the measured F2b visualization flags
-    (geom/site group toggles + mjVIS_* flags to switch off). Raw-Renderer
-    output only matches robosuite obs rendering under these flags (G7)."""
+@dataclass(frozen=True)
+class SceneOption:
+    """The measured F2b visualization state (G7): an ``mujoco.MjvOption``
+    carrying ONLY the geom/site group toggles, plus the ``mjtRndFlag`` values
+    to clear on ``renderer.scene.flags`` after ``update_scene`` — the facts
+    producer (scripts/gsaug/probe_render_facts.py RawRenderer, F2B_RND_FLAGS)
+    applies ``flags_off`` to the SCENE flags, never to ``MjvOption.flags``."""
+
+    mjv_option: object                  # mujoco.MjvOption
+    rnd_flags_off: Tuple[int, ...]      # mujoco.mjtRndFlag values
+
+
+def scene_option_from_facts(facts: dict) -> SceneOption:
+    """:class:`SceneOption` realizing the measured F2b visualization flags.
+
+    ``MjvOption`` gets only the geom/site group toggles; ``flags_off`` entries
+    are ``mjRND_*`` scene-flag names (the facts producer's sweep space) that
+    :func:`render_view` clears on ``renderer.scene.flags`` after
+    ``update_scene``, mirroring how the producer applied them. Raw-Renderer
+    output only matches robosuite obs rendering under these settings (G7)."""
     import mujoco
     flags = facts["F2b"]["flags"]
     opt = mujoco.MjvOption()
@@ -220,16 +236,16 @@ def scene_option_from_facts(facts: dict):
             f"facts F2b flags[{attr!r}] = {values!r}: expected "
             f"{len(getattr(opt, attr))} 0/1 entries (G7)")
         getattr(opt, attr)[:] = np.asarray(values, dtype=np.uint8)
+    rnd_off = []
     for name in flags.get("flags_off", []):
-        enum_name = name if name.startswith("mjVIS_") else f"mjVIS_{name.upper()}"
-        flag = getattr(mujoco.mjtVisFlag, enum_name, None)
+        flag = getattr(mujoco.mjtRndFlag, name, None)
         if flag is None:
             raise RuntimeError(
-                f"facts F2b flags_off entry {name!r} is not a mujoco.mjtVisFlag "
-                f"({enum_name} not found) — facts file and mujoco version "
-                f"disagree (G7)")
-        opt.flags[flag] = 0
-    return opt
+                f"facts F2b flags_off entry {name!r} is not a "
+                f"mujoco.mjtRndFlag scene flag — facts file and mujoco "
+                f"version disagree (G7)")
+        rnd_off.append(int(flag))
+    return SceneOption(mjv_option=opt, rnd_flags_off=tuple(rnd_off))
 
 
 def free_camera_fovy(env) -> float:
@@ -251,10 +267,21 @@ def render_view(renderer, data, cam, scene_option=None
     returns (H, W, 2) int32 — channel 0 is the object id, channel 1 the object
     type; under the F2b flags every visible object must be a geom, which is
     asserted (a leaked site/other type would corrupt geom-id maps, F6).
+
+    ``scene_option`` may be a :class:`SceneOption` (the F2b contract: its
+    MjvOption drives ``update_scene`` and its mjRND_* entries are cleared on
+    ``renderer.scene.flags`` afterwards — the same scene the three renders
+    below share) or a bare ``mujoco.MjvOption``.
     """
     import mujoco
     raw = _raw_data(data)
-    renderer.update_scene(raw, camera=cam, scene_option=scene_option)
+    opt, rnd_flags_off = scene_option, ()
+    if isinstance(scene_option, SceneOption):
+        opt = scene_option.mjv_option
+        rnd_flags_off = scene_option.rnd_flags_off
+    renderer.update_scene(raw, camera=cam, scene_option=opt)
+    for flag in rnd_flags_off:
+        renderer.scene.flags[flag] = 0
 
     rgb = renderer.render()
     assert rgb.dtype == np.uint8 and rgb.ndim == 3 and rgb.shape[2] == 3, (

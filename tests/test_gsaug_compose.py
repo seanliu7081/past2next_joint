@@ -8,9 +8,10 @@ Synthetic scenes only — no env, no sim: components are built directly as
 modes that need no env (missing manifest, non-PASSing facts) are covered with
 temp files.
 
-T1 rigid-transform consistency, T2 z-rotation SH invariance, T3 SO(3) l=1 SH
-invariance, T4 occlusion (concat == merged; image-space compositing fails),
-T5 camera-math round-trip (<= 0.5 px), T6 repeatability (uint8 tol 1).
+T1 rigid-transform consistency, T2 z-rotation SH invariance, T2b full-SO(3)
+deg-3 SH invariance (R7), T3 SO(3) l=1 SH invariance, T4 occlusion (concat ==
+merged; image-space compositing fails), T5 camera-math round-trip (<= 0.5 px),
+T6 repeatability (uint8 tol 1).
 """
 
 import json
@@ -151,9 +152,10 @@ def test_t1_rigid_transform_consistency():
 
 def test_t2_sh_z_rotation_invariance():
     """Anisotropic deg-3 SH: rotating component AND camera by the same R_z
-    about the same center leaves the image unchanged — pins the z_only_deg3
-    sign conventions end-to-end through the real rasterizer (G5)."""
-    comp = make_component("z_only_deg3", 3, n=4, seed=1, sh_scale=0.35)
+    about the same center leaves the image unchanged — pins so3_deg3's
+    closed-form z fast-path sign conventions end-to-end through the real
+    rasterizer (G5)."""
+    comp = make_component("so3_deg3", 3, n=4, seed=1, sh_scale=0.35)
     theta = math.radians(50.0)
     Rz4 = rigid4(rodrigues([0, 0, 1], theta))
 
@@ -162,6 +164,23 @@ def test_t2_sh_z_rotation_invariance():
                            [Rz4 @ C2W0])
     p = psnr(img_rot[0], img_ref[0])
     assert p >= 45.0, f"T2 z-rotation invariance PSNR {p:.1f} < 45"
+
+
+def test_t2b_sh_so3_rotation_invariance_deg3():
+    """T2b (R7): deg-3 'so3_deg3' component under a random FULL SO(3) rotation
+    about its pose center with the co-rotated camera: image unchanged. This is
+    the end-to-end proof that the exact projection path (rotate_sh_so3) is
+    correct in gsplat's own basis — the tumbled-object case that used to
+    assert now renders exactly (G5)."""
+    comp = make_component("so3_deg3", 3, n=4, seed=4, sh_scale=0.35)
+    axis, ang = [0.5, -0.3, 0.6], 1.0   # mixes z with x/y — off the fast path
+    R4 = rigid4(rodrigues(axis, ang))
+
+    img_ref, _ = rasterize(comp.posed(np.zeros(3), IDENT_Q), [C2W0])
+    img_rot, _ = rasterize(comp.posed(np.zeros(3), aa_quat(axis, ang)),
+                           [R4 @ C2W0])
+    p = psnr(img_rot[0], img_ref[0])
+    assert p >= 45.0, f"T2b full-SO(3) deg-3 invariance PSNR {p:.1f} < 45"
 
 
 # ── T3: SH SO(3) l=1 invariance ──────────────────────────────────────────────
@@ -249,7 +268,7 @@ def test_t5_camera_math_roundtrip():
 # ── T6: repeatability ────────────────────────────────────────────────────────
 
 def test_t6_repeatability_uint8_tol1():
-    comp = make_component("z_only_deg3", 3, n=4, seed=3)
+    comp = make_component("so3_deg3", 3, n=4, seed=3)
     world = comp.posed(np.zeros(3), IDENT_Q)
     img1, _ = rasterize(world, [C2W0])
     img2, _ = rasterize(comp.posed(np.zeros(3), IDENT_Q), [C2W0])

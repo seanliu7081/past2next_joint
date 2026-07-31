@@ -70,7 +70,8 @@ _FIT_DEFAULTS = dict(
     lrs=None,
     prune_iter=2000,                 # single opacity prune (plan §6.4)
     prune_opacity=0.005,
-    eef_link=None,                   # None -> first link name containing 'hand'
+    eef_link=None,                   # None -> gripper0_right_gripper, else the
+                                     # first 'gripper'/'hand' link (see fit)
     log_every=1000,
 )
 
@@ -380,8 +381,20 @@ def fit_robot(bundle: CaptureBundle, out_path: str,
                   f"n={params['means'].shape[0]}")
 
     # ── held-out metrics (plan §6.4) ────────────────────────────────────────
-    eef_link = cfg["eef_link"] or next(
-        (n for n in link_names if "hand" in n), link_names[-1])
+    # EEF anchor: on the Panda stack 'robot0_right_hand' carries NO geoms (the
+    # visible hand geoms live on 'gripper0_right_gripper'), so a bare 'hand'
+    # match would anchor the metric at a geomless link and read a vacuous
+    # 0.0 px. Prefer the gripper link; NEVER fall back silently — a wrong
+    # anchor makes eef_median_px meaningless.
+    eef_link = cfg["eef_link"] or (
+        "gripper0_right_gripper" if "gripper0_right_gripper" in link_names
+        else next((n for n in link_names if "gripper" in n), None)
+        or next((n for n in link_names if "hand" in n), None))
+    if eef_link is None:
+        raise RuntimeError(
+            f"no EEF anchor link found: no link name contains 'gripper' or "
+            f"'hand' among link_names={link_names} — pass an explicit "
+            f"eef_link=<link name> override to fit_robot")
     assert eef_link in link_names, f"eef_link {eef_link!r} not in link_names"
     eef_l = link_names.index(eef_link)
     eval_cfgs = holdout_cfgs if holdout_cfgs else train_cfgs

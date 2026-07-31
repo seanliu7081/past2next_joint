@@ -138,6 +138,14 @@ def manifest_sha1_of(manifest: dict) -> str:
 
 def train_task(task: str, components: List[str],
                args: argparse.Namespace) -> List[Tuple[str, Dict]]:
+    """Train the requested components for one task and update its manifest.
+
+    The manifest read-modify-write ends in an atomic tmp + ``os.replace`` (the
+    oat/equi/normalization.py save_spec pattern), so a crash never leaves a
+    torn manifest.json. NOTE: concurrent per-component runs of the SAME task
+    remain last-writer-wins on distinct entries (each run rewrites the whole
+    file from its own read).
+    """
     task_dir = os.path.join(args.assets_root, task)
     cap_dir = os.path.join(task_dir, "captures")
     print(f"[train_gs_assets] === {task} ({', '.join(components)}) ===")
@@ -261,8 +269,11 @@ def train_task(task: str, components: List[str],
             train_args[comp_key] = asset.meta.get("train_args")
 
     manifest["manifest_sha1"] = manifest_sha1_of(manifest)
-    with open(manifest_path, "w") as f:
+    # atomic replace (save_spec pattern): never leave a torn manifest.json
+    tmp_path = manifest_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, manifest_path)
     print(f"[train_gs_assets] {task}: manifest -> {manifest_path} "
           f"(sha1 {manifest['manifest_sha1'][:12]}…)")
 

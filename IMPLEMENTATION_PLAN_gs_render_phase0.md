@@ -98,6 +98,30 @@ Do not assume; verify. Deliverable: a short `M0_NOTES.md` recording each item.
 > robosuite obs rendering (MAD ≈ 15 at stock flags); (c) configs live under
 > `oat/config/...`, not `conf/...`; (d) arm A6 (§10) deferred per its own build-only-if
 > criterion; (e) e3nn stays uninstalled — the wigner path imports it lazily.
+>
+> **Post-implementation review outcome (2026-07-31).** Measured corrections to this
+> plan's assumptions, found by adversarial review against real demo data:
+> (f) **§6.1's pure-z premise is false on real data** — the world delta between an
+> object's *capture* pose (fresh reset) and its *demo* pose is never a pure
+> z-rotation (resting-settle tilt |q_xy| ≈ 2e-3–3e-3 on 100% of frames; grasped
+> objects tumble to |q_xy| ≈ 0.8). R7 therefore fired universally, and the remedy is
+> an **exact dependency-free SO(3) real-SH rotation for l ≤ 3**
+> (`sh_rotation.rotate_sh_so3`, per-band matrices built by exact projection): object
+> components use mode `so3_deg3` (closed-form z fast path when the delta *is* pure-z,
+> exact SO(3) otherwise); the pure-z assertion and the e3nn contingency are replaced —
+> G5's "SH rotates whenever means rotate" now holds unconditionally.
+> (g) The F2 orientation chain in §4 is corrected by measurement: raw-Renderer
+> orientation **equals** stored-zarr orientation (raw = flip(obs) bit-exactly under the
+> F2b parity flags, and the zarr stores flip(obs)), so gsplat output needs **no** flip
+> (`gsplat_flip_ud = false`).
+> (h) §8.1's EEF thresholds (2 px / 4 px) are below the measured oracle-ground-truth
+> floor (median 3.45 px / p95 12.3 px); probe defaults recalibrated to 6 px / 16 px per
+> R6/§11.
+> (i) §7.4's "§8.2 metrics written into the report JSON" live canonically in
+> `probe_gs_photometric.json` (same ≤64-frame budget); the pre-render report carries the
+> θ=0 MAD stats only.
+> (j) Concurrent GS-mode `--tasks` shards are NOT provenance-safe (zarr root-attrs
+> merges are last-writer-wins): run GS shards sequentially.
 
 ---
 

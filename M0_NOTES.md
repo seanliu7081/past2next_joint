@@ -84,3 +84,26 @@ machine, in the `oat` conda env (`/home/haotian/miniforge3/envs/oat/bin/python`)
 ## Gate
 
 All M0 items confirmed. Proceed to M1.
+
+---
+
+# Post-implementation review addendum (2026-07-31)
+
+Adversarial review of the finished implementation against real demo data produced
+further measured corrections (full list in the plan's M0/post-review block):
+
+- **Pure-z object deltas do not exist in practice** — capture-reset vs demo resting
+  poses differ by settling tilt on every frame, grasped objects tumble; object SH now
+  rotates through an exact in-house SO(3) path (`rotate_sh_so3`, no e3nn), mode
+  `so3_deg3` with a pure-z fast path.
+- **Orientation chain corrected**: raw Renderer == stored zarr orientation (measured
+  bit-exact), so `gsplat_flip_ud = false`; an earlier inverted derivation would have
+  written upside-down GS frames — fixed and re-measured.
+- EEF probe thresholds recalibrated (oracle GT floor: median 3.45 px / p95 12.3 px →
+  defaults 6/16 px); unbounded per-θ SH cache removed; EEF metric anchor fixed
+  (was silently the robot mount); F2b `flags_off` is mjRND (scene-flag) namespace;
+  A5 hybrid copy now validates source provenance + completeness; GS resume hard-fails
+  on retrained assets (manifest sha mismatch); holdout views excluded from depth init;
+  manifest writes atomic.
+- gsplat 1.5.3 quirk: `DefaultStrategy`'s opacity reset never fires (precedence bug);
+  the trainer calls `reset_opa` on schedule itself.

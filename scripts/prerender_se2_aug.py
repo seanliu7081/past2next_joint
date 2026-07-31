@@ -39,6 +39,10 @@ root.attrs['gs_manifest_sha1'] = {task_name: manifest_sha1} per task.
 --hybrid-zero-from ORACLE_ZARR (arm A5): after all tasks complete, copies
 images/*/angle_00 verbatim from the oracle zarr and sets render_source
 'gs_hybrid0'.
+GS-shard provenance caveat: with concurrent GS-mode --tasks shards, the
+meta/render_source creation and the root.attrs['gs_manifest_sha1'] merge are
+NOT concurrency-safe -- run GS shards sequentially or accept last-writer-wins
+on the attrs (each shard's report JSON carries its own authoritative sha1 map).
 
 Usage:
     MUJOCO_GL=egl python scripts/prerender_se2_aug.py \
@@ -468,6 +472,17 @@ def main() -> None:
     base_images = {cam: base_root["data"][cam] for cam in CAMERAS}
     for cam, arr in base_images.items():
         assert arr.shape[0] == n_steps, f"base zarr {cam} length != episode_ends[-1]"
+    if args.renderer == "gs":
+        # G8: GS mode must render at the dataset-native resolution --
+        # intrinsics come from cam_fovy at --image_size and the theta=0 frames
+        # are MAD-gated pixelwise against the base zarr; checked at startup,
+        # BEFORE any renderer is built.
+        for cam, arr in base_images.items():
+            assert int(arr.shape[1]) == int(args.image_size), (
+                f"[G8] base zarr '{cam}' stores {arr.shape[1]}x{arr.shape[2]} "
+                f"frames but --image_size is {args.image_size}; GS mode must "
+                f"render at the dataset-native resolution -- rerun with "
+                f"--image_size {int(arr.shape[1])}")
 
     # theta=0 pixel gate thresholds (GS mode uses the gross-error gate, §7.4)
     pixel_warn = PIXEL_DIFF_WARN_GS if args.renderer == "gs" else PIXEL_DIFF_WARN
@@ -525,6 +540,33 @@ def main() -> None:
             f"unknown --tasks {unknown}; available: {list(task_to_eps.keys())}")
         task_to_eps = OrderedDict((t, task_to_eps[t]) for t in task_to_eps if t in selected)
     scope_eps = [e for eps in task_to_eps.values() for e in eps]
+
+    # ── A5 --hybrid-zero-from startup checks (plan §7.6) ────────────────────
+    if args.hybrid_zero_from:
+        # the 'gs_hybrid0' stamp covers the WHOLE zarr; plan §7.6 runs the A5
+        # copy after ALL tasks complete -- refusing task shards here keeps a
+        # partially rendered zarr from being stamped as a finished arm
+        assert args.tasks == "all", (
+            "--hybrid-zero-from stamps render_source='gs_hybrid0' on the "
+            "whole zarr (plan §7.6: after all tasks complete); refusing to "
+            "combine it with --tasks shards -- run the shards first, then one "
+            "final --hybrid-zero-from pass with --tasks all")
+        hz_src_root = zarr.open(args.hybrid_zero_from, mode="r")
+        hz_src = hz_src_root.attrs.get("render_source")
+        if hz_src is None and "meta/render_source" in hz_src_root:
+            hz_src = str(hz_src_root["meta/render_source"][0])
+        hz_src = "oracle" if hz_src is None else str(hz_src)
+        assert hz_src == "oracle", (
+            f"--hybrid-zero-from {args.hybrid_zero_from} carries "
+            f"render_source={hz_src!r}, not 'oracle' -- A5 copies ORACLE "
+            "theta=0 frames; point it at the oracle aug zarr")
+        assert np.asarray(hz_src_root["meta/done_mask"][:, 0]).all(), (
+            f"--hybrid-zero-from {args.hybrid_zero_from}: meta/done_mask[:,0] "
+            "has unfinished episodes -- finish the oracle prerender first")
+        assert np.asarray(hz_src_root["meta/valid_mask"][:, 0]).all(), (
+            f"--hybrid-zero-from {args.hybrid_zero_from}: meta/valid_mask"
+            "[:,0] has invalid theta=0 entries -- the oracle aug zarr is "
+            "corrupt (theta=0 must be valid for every episode)")
 
     # render source this run writes; a finished A5 zarr ('gs_hybrid0') may be
     # re-opened only when --hybrid-zero-from is passed again
@@ -716,8 +758,18 @@ def main() -> None:
                 sha1 = str(gs_renderer.manifest["manifest_sha1"])
                 gs_manifest_sha1_by_task[task_name] = sha1
                 # G9: per-task provenance on the zarr itself (attrs merge so
-                # per-task shards accumulate rather than clobber)
+                # per-task shards accumulate rather than clobber). A resumed
+                # zarr recording a DIFFERENT sha for this task means its
+                # already-written images came from other assets -- never
+                # silently overwrite the recorded provenance.
                 stored = dict(out_root.attrs.get("gs_manifest_sha1", {}))
+                prev_sha1 = stored.get(task_name)
+                if prev_sha1 is not None and str(prev_sha1) != sha1:
+                    fail(f"{task_name}: this zarr records gs_manifest_sha1 "
+                         f"{str(prev_sha1)[:12]}… but the current manifest is "
+                         f"{sha1[:12]}… -- assets retrained since this zarr's "
+                         "images were rendered; rebuild with --no-resume or "
+                         "restore the original assets")
                 stored[task_name] = sha1
                 out_root.attrs["gs_manifest_sha1"] = stored
 

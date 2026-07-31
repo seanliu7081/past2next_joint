@@ -13,10 +13,21 @@ the body's *current* pose (from the forwarded sim's ``data.xpos/xquat``):
 
 ``sh_rot_mode``:
     'static'      background — pose must be identity, SH untouched
-    'z_only_deg3' objects — asserts R_delta is a pure z-rotation (tol; R7),
-                  then closed-form ``rotate_sh_z``
+    'so3_deg3'    objects — exact SH rotation for ANY R_delta: closed-form
+                  ``rotate_sh_z`` fast path when the delta is z-only
+                  (|qx|,|qy| <= FAST_Z_TOL), exact ``rotate_sh_so3`` otherwise
     'so3_deg1'    robot links — exact l=1 rule under arbitrary R_delta
-    'wigner'      G5 upgrade path (requires e3nn); only set explicitly
+    'wigner'      e3nn cross-check path (optional dep); only set explicitly
+    ('z_only_deg3' is accepted as a deprecated alias for 'so3_deg3'.)
+
+R7 history: 'z_only_deg3' originally ASSERTED the delta was a pure z-rotation
+(tol 1e-5), with e3nn wigner as the contingency. Adversarial review measured
+that assertion firing on ~100% of real LIBERO-10 frames — capture-reset
+resting poses differ from demo resting poses by settling tilt (|q_xy| ~
+2.4e-3..3.4e-3) and grasped objects tumble (up to |q_xy| ~ 0.83) — so the
+exact in-house SO(3) projection path replaced both the assertion and the e3nn
+contingency. SH now rotates exactly for any delta, so the G5 invariant ("SH
+rotates whenever means rotate") holds unconditionally.
 
 G5 invariant: there is no way to move a component's means/quats through this
 class without its SH being routed through ``sh_rotation`` — do not add one.
@@ -32,9 +43,16 @@ from typing import List, Optional
 import torch
 
 from oat.gsaug.gaussian_asset import GaussianAsset
-from oat.gsaug.sh_rotation import rotate_sh_l1, rotate_sh_wigner, rotate_sh_z
+from oat.gsaug.sh_rotation import (
+    rotate_sh_l1,
+    rotate_sh_so3,
+    rotate_sh_wigner,
+    rotate_sh_z,
+)
 
-PURE_Z_TOL = 1e-5  # |x|,|y| components of the unit delta quat (plan §6.1)
+# |x|,|y| of the unit delta quat below which the closed-form z path is used
+# (both paths are exact; this only selects the cheaper one).
+FAST_Z_TOL = 1e-6
 
 
 # ── torch quaternion helpers (wxyz) ─────────────────────────────────────────
@@ -112,7 +130,7 @@ class WorldGaussians:
 
 # ── the component ───────────────────────────────────────────────────────────
 
-SH_ROT_MODES = ("static", "z_only_deg3", "so3_deg1", "wigner")
+SH_ROT_MODES = ("static", "so3_deg3", "so3_deg1", "wigner")
 
 
 class PosedComponent:
@@ -120,6 +138,8 @@ class PosedComponent:
                  log_scales: torch.Tensor, opacity_logits: torch.Tensor,
                  sh: torch.Tensor, sh_rot_mode: str,
                  p_capture: torch.Tensor, q_capture: torch.Tensor):
+        if sh_rot_mode == "z_only_deg3":  # deprecated pre-R7 alias (module docstring)
+            sh_rot_mode = "so3_deg3"
         assert sh_rot_mode in SH_ROT_MODES, sh_rot_mode
         if sh_rot_mode == "so3_deg1" and sh.shape[1] != 4:
             raise ValueError(
@@ -134,7 +154,6 @@ class PosedComponent:
         self.sh_rot_mode = sh_rot_mode
         self.p_capture = p_capture.reshape(3).float()
         self.q_capture = quat_normalize(q_capture.reshape(4).float())
-        self._sh_cache = {}  # theta (rounded) -> rotated SH, for z_only_deg3
 
     @property
     def device(self) -> torch.device:
@@ -144,7 +163,6 @@ class PosedComponent:
         for k in ("means_l", "quats_l", "log_scales", "opacity_logits", "sh",
                   "p_capture", "q_capture"):
             setattr(self, k, getattr(self, k).to(device))
-        self._sh_cache = {}
         return self
 
     @classmethod
@@ -163,7 +181,7 @@ class PosedComponent:
             p_capture=p_cap.to(device), q_capture=q_cap.to(device),
         ).to(device)
 
-    # ── the one posing path (G5 assertion lives here) ───────────────────────
+    # ── the one posing path (G5 routing lives here) ─────────────────────────
 
     def posed(self, p_wb, q_wb) -> WorldGaussians:
         """World gaussians for current body pose (p_wb (3,), q_wb (4,) wxyz)."""
@@ -193,19 +211,15 @@ class PosedComponent:
         q_delta = quat_mul(q_wb, quat_conj(self.q_capture))
         q_delta = quat_normalize(q_delta)
 
-        if self.sh_rot_mode == "z_only_deg3":
-            if q_delta[1].abs() > PURE_Z_TOL or q_delta[2].abs() > PURE_Z_TOL:
-                raise AssertionError(
-                    f"component '{self.name}': pose delta since capture is not a "
-                    f"pure z-rotation (|qx|={q_delta[1].abs():.2e}, "
-                    f"|qy|={q_delta[2].abs():.2e} > {PURE_Z_TOL}); this object "
-                    f"tumbled relative to its capture pose — upgrade its "
-                    f"sh_rot_mode to 'wigner' (R7/G5) rather than mis-shading.")
-            theta = 2.0 * math.atan2(float(q_delta[3]), float(q_delta[0]))
-            key = round(theta, 9)
-            if key not in self._sh_cache:
-                self._sh_cache[key] = rotate_sh_z(self.sh, theta)
-            sh_w = self._sh_cache[key]
+        if self.sh_rot_mode == "so3_deg3":
+            # Exact for ANY delta (G5/R7): real demos tilt at reset and tumble
+            # when grasped, so there is no assertion and no error path — only
+            # a fast-path selection between two exact rotations.
+            if q_delta[1].abs() <= FAST_Z_TOL and q_delta[2].abs() <= FAST_Z_TOL:
+                theta = 2.0 * math.atan2(float(q_delta[3]), float(q_delta[0]))
+                sh_w = rotate_sh_z(self.sh, theta)
+            else:
+                sh_w = rotate_sh_so3(self.sh, quat_to_R(q_delta))
         elif self.sh_rot_mode == "so3_deg1":
             sh_w = rotate_sh_l1(self.sh, quat_to_R(q_delta))
         elif self.sh_rot_mode == "wigner":
