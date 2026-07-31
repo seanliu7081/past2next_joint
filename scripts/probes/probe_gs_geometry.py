@@ -349,8 +349,15 @@ def main():
     # gate thresholds (plan §8.1 defaults)
     parser.add_argument("--iou_obj_p5", type=float, default=0.90)
     parser.add_argument("--iou_robot_p5", type=float, default=0.85)
-    parser.add_argument("--eef_median_px", type=float, default=2.0)
-    parser.add_argument("--eef_p95_px", type=float, default=4.0)
+    # Recalibrated from the plan's provisional 2.0/4.0 (R6/§11: thresholds are
+    # gross-failure catches, recalibrated from measurement): on ORACLE ground
+    # truth over 103 real demo triples / 8 tasks, the right_hand-origin
+    # distance-to-mask floor is median 3.45 px / p95 12.3 px / max 21.4 px
+    # (the body origin projects ~3 px off its subtree silhouette even with
+    # perfect rendering). Defaults sit above that floor with margin; a real
+    # camera-math bug misses by 36-72 px (F1 wrong-flip margins).
+    parser.add_argument("--eef_median_px", type=float, default=6.0)
+    parser.add_argument("--eef_p95_px", type=float, default=16.0)
     parser.add_argument("--wrist_psnr_min", type=float, default=32.0)
     parser.add_argument("--min_mask_px", type=int, default=20,
                         help="skip IoU/wrist measurements whose oracle mask is "
