@@ -1,0 +1,20 @@
+# Arm A5 (plan §9): SE(2) augmentation ON over the hybrid zarr -- GS renders
+# at theta!=0 but ORACLE frames copied verbatim at angle_00
+# (prerender --hybrid-zero-from). Tests whether provenance uniformity (G6/D1)
+# is worth more than in-domain theta=0 frames. Render-source gate (G9) expects
+# 'gs_hybrid0'. Policy is the plain AugFlowPolicy (pure randn source).
+defaults:
+  - train_equi_flowpolicy
+  - override task/policy: libero/libero10_se2aug_gs
+  - _self_
+
+name: train_flow_gs_hybrid0_fullft
+
+policy:
+  _target_: oat.policy.aug_flow_policy.AugFlowPolicy
+  source: null
+
+aug:
+  zarr_path: data/libero/libero10_N500_se2aug_gs_hybrid0.zarr
+  expected_render_source: gs_hybrid0
+  probe_gs_geometry_path: data/libero/probe_gs_geometry.json

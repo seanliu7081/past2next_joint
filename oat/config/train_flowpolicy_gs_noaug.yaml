@@ -1,0 +1,21 @@
+# Arm A2 (plan §9): augmentation OFF, images from the GS-rendered aug zarr at
+# theta=0 (angle_00) -- measures the pure GS render-domain cost with no
+# augmentation. aug.enable=false but image_source stays 'aug', so frames come
+# from the GS zarr while labels stay raw. Render-source gate (G9) as in A4.
+# Policy is the plain AugFlowPolicy (pure randn source).
+defaults:
+  - train_equi_flowpolicy
+  - override task/policy: libero/libero10_se2aug_gs
+  - _self_
+
+name: train_flow_gs_noaug_fullft
+
+policy:
+  _target_: oat.policy.aug_flow_policy.AugFlowPolicy
+  source: null
+
+aug:
+  enable: false
+  zarr_path: data/libero/libero10_N500_se2aug_gs.zarr
+  expected_render_source: gs
+  probe_gs_geometry_path: data/libero/probe_gs_geometry.json

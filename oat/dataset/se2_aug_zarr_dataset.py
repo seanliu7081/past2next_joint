@@ -75,6 +75,8 @@ class SE2AugZarrDataset(BaseDataset):
         world_frame_rotation: bool = False,
         emit_angle_pair: bool = False,
         naive_image_rotation: bool = False,
+        expected_render_source: Optional[str] = None,
+        probe_gs_geometry_path: str = 'data/libero/probe_gs_geometry.json',
     ):
         super().__init__()
         assert n_obs_steps + n_action_steps > 0, "should have at least one frame"
@@ -158,6 +160,60 @@ class SE2AugZarrDataset(BaseDataset):
                     "scripts/prerender_se2_aug.py."
                 )
             aug_root = zarr.open(aug_zarr_path, 'r')
+
+            # render-source gating (G9, plan §8.1/§9): a GS training arm must
+            # not start on a zarr rendered by a different pipeline. The aug
+            # zarr self-describes its renderer via root attrs 'render_source'
+            # (mirrored in a meta/render_source string array by
+            # scripts/prerender_se2_aug.py); zarrs that predate the key are
+            # oracle by definition.
+            if expected_render_source is not None:
+                actual_source = aug_root.attrs.get('render_source')
+                if actual_source is None and 'meta/render_source' in aug_root:
+                    v = aug_root['meta/render_source'][0]
+                    actual_source = (
+                        v.decode('utf-8') if isinstance(v, bytes) else str(v))
+                if actual_source is None:
+                    actual_source = 'oracle'
+                if actual_source != expected_render_source:
+                    raise RuntimeError(
+                        f"aug zarr '{aug_zarr_path}' carries render_source="
+                        f"'{actual_source}' but this dataset expects "
+                        f"expected_render_source='{expected_render_source}': "
+                        f"the pre-rendered images do not come from the "
+                        f"required renderer. Point aug_zarr_path at a zarr "
+                        f"pre-rendered with the matching "
+                        f"scripts/prerender_se2_aug.py --renderer mode, or "
+                        f"fix expected_render_source."
+                    )
+                # GS renders are additionally gated on the geometry probe
+                # (D7 pattern, mirrors the controller-frame gate above).
+                if expected_render_source.startswith('gs'):
+                    if not os.path.exists(probe_gs_geometry_path):
+                        raise RuntimeError(
+                            f"probe results not found at "
+                            f"'{probe_gs_geometry_path}': GS-rendered "
+                            f"training data (expected_render_source="
+                            f"'{expected_render_source}') is gated on the GS "
+                            f"geometry probe. Run "
+                            f"scripts/probes/probe_gs_geometry.py first."
+                        )
+                    with open(probe_gs_geometry_path) as f:
+                        gs_probe = json.load(f)
+                    if gs_probe.get('pass') is not True:
+                        raise RuntimeError(
+                            f"'{probe_gs_geometry_path}' reports pass="
+                            f"{gs_probe.get('pass')!r} (the GS geometry probe "
+                            f"did not PASS: silhouette IoU / EEF projection / "
+                            f"wrist transform-stack check failed, or the file "
+                            f"predates the 'pass' key): refusing to train on "
+                            f"GS renders. Re-run "
+                            f"scripts/probes/probe_gs_geometry.py (e.g. "
+                            f"MUJOCO_GL=egl python "
+                            f"scripts/probes/probe_gs_geometry.py --out "
+                            f"{probe_gs_geometry_path}) until it PASSes."
+                        )
+
             aug_ends = np.asarray(aug_root['meta/episode_ends'][:])
             assert np.array_equal(aug_ends, np.asarray(episode_ends)), (
                 "aug zarr meta/episode_ends differs from the base zarr's -- it was "
@@ -248,6 +304,8 @@ class SE2AugZarrDataset(BaseDataset):
         self.world_frame_rotation = world_frame_rotation
         self.emit_angle_pair = emit_angle_pair
         self.naive_image_rotation = naive_image_rotation
+        self.expected_render_source = expected_render_source
+        self.probe_gs_geometry_path = probe_gs_geometry_path
         self.seed = seed
 
         self.episode_ends = np.asarray(episode_ends)

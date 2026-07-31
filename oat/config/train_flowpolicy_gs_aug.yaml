@@ -1,0 +1,23 @@
+# Arm A4 (plan §9): SE(2) augmentation ON, images from the GS-rendered aug
+# zarr. Same data pipeline, task, and frozen normalization spec as
+# train_flowpolicy_aug; the only differences are the aug zarr (GS renders) and
+# the render-source gate (G9): the dataset refuses to start unless the zarr
+# self-reports render_source='gs' AND probe_gs_geometry.json PASSes. Policy is
+# the plain AugFlowPolicy (pure randn source), like train_flowpolicy_aug.
+defaults:
+  - train_equi_flowpolicy
+  - override task/policy: libero/libero10_se2aug_gs
+  - _self_
+
+name: train_flow_gs_aug_fullft
+
+policy:
+  _target_: oat.policy.aug_flow_policy.AugFlowPolicy
+  source: null
+
+aug:
+  zarr_path: data/libero/libero10_N500_se2aug_gs.zarr
+  # consumed by the task dataset via ${oc.select:aug.*} (keys absent in the
+  # base config's aug group; merged additively here via _self_)
+  expected_render_source: gs
+  probe_gs_geometry_path: data/libero/probe_gs_geometry.json

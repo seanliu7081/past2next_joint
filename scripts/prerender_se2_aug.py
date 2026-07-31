@@ -18,11 +18,39 @@ processes via --tasks (image chunks and per-episode meta chunks make writes of
 different tasks disjoint -- start shards only after one run has created the
 output zarr).
 
+Render sources (plan IMPLEMENTATION_PLAN_gs_render_phase0.md §7, M6):
+    --renderer oracle (default)  MuJoCo re-render, byte-identical to before.
+    --renderer gs                Gaussian-Splatting composite renderer
+                                 (oat.gsaug.compose.GSCompositeRenderer). MuJoCo
+                                 stays in the loop for states/contacts/camera
+                                 poses (G3); only rasterization is replaced.
+                                 Validity is oracle-owned (G4): delta is COPIED
+                                 from --oracle-zarr meta/state_offset, and
+                                 valid_mask / p_base / angles_deg / episode_ends
+                                 are hard-asserted equal to the oracle aug zarr.
+
+Provenance meta (G9) -- written by BOTH modes; documented choice: the value is
+stored twice, (a) meta/render_source, a shape-(1,) VLenUTF8 zarr string array
+(travels with meta through zarr copies), and (b) root.attrs['render_source']
+(cheap to read without touching arrays); absence of both == 'oracle' (zarrs
+predating GS support; resuming such a zarr creates the meta). Values:
+{'oracle', 'gs', 'gs_hybrid0', 'gs_oracle_robot'}. GS mode additionally writes
+root.attrs['gs_manifest_sha1'] = {task_name: manifest_sha1} per task.
+--hybrid-zero-from ORACLE_ZARR (arm A5): after all tasks complete, copies
+images/*/angle_00 verbatim from the oracle zarr and sets render_source
+'gs_hybrid0'.
+
 Usage:
     MUJOCO_GL=egl python scripts/prerender_se2_aug.py \
         --base_zarr data/libero/libero10_N500.zarr \
         --hdf5_dir third_party/LIBERO/libero/datasets/libero_10 \
         --out data/libero/libero10_N500_se2aug.zarr --resume
+
+GS mode:
+    MUJOCO_GL=egl python scripts/prerender_se2_aug.py --renderer gs \
+        --gs-assets-dir data/libero/gs_assets \
+        --oracle-zarr data/libero/libero10_N500_se2aug.zarr \
+        --out data/libero/libero10_N500_se2aug_gs.zarr
 """
 
 import os
@@ -79,11 +107,27 @@ CAMERAS = OrderedDict(
     ]
 )
 
+# zarr image key -> mujoco camera name for GSCompositeRenderer; the compose
+# contract takes explicit names (robosuite obs key minus '_image' is NOT
+# assumed there)
+GS_CAMERAS = OrderedDict(
+    [
+        ("agentview_rgb", "agentview"),
+        ("robot0_eye_in_hand_rgb", "robot0_eye_in_hand"),
+    ]
+)
+
 N_SAMPLED_FRAMES = 5           # per (episode, angle) for inline stats
 CALIB_EPISODES = 3             # episodes per task for delta calibration (probe 2 pattern)
 RENDER_WARN_M = 1e-3           # eef-pos consistency warn threshold (probe 2 owns the hard gate)
 PIXEL_DIFF_WARN = 1.0          # theta=0 mean |render - base| per task, uint8 units
 PIXEL_DIFF_FAIL = 5.0
+# GS-mode theta=0 gate (plan §7.4): gross-error gate only -- GS-vs-stored MAD
+# legitimately sits in the 5-20 band (baked GS appearance vs mujoco shading);
+# 25 still catches a wrong delta / flip / camera. WARN raised to 20 (not 1) so
+# the expected appearance gap does not spam a warning for every task.
+PIXEL_DIFF_WARN_GS = 20.0
+PIXEL_DIFF_FAIL_GS = 25.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,7 +159,36 @@ def parse_args() -> argparse.Namespace:
                              "AABB shrunk by this margin")
     parser.add_argument("--joint_margin", type=float, default=0.05,
                         help="joint-1 limit margin in radians")
-    return parser.parse_args()
+    parser.add_argument(
+        "--renderer", type=str, choices=("oracle", "gs"), default="oracle",
+        help="pixel source: 'oracle' = MuJoCo re-render (default, unchanged "
+             "behavior); 'gs' = Gaussian-Splatting composite renderer (plan §7)")
+    parser.add_argument(
+        "--gs-assets-dir", dest="gs_assets_dir", type=str,
+        default="data/libero/gs_assets",
+        help="per-task GS asset root (<dir>/<task>/{assets,manifest.json})")
+    parser.add_argument(
+        "--oracle-zarr", dest="oracle_zarr", type=str, default=None,
+        help="ORACLE aug zarr for G4 cross-checks in GS mode (delta source; "
+             "valid_mask/p_base/angles_deg/episode_ends must match)")
+    parser.add_argument(
+        "--oracle-crosscheck", dest="oracle_crosscheck",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="G4 cross-asserts against --oracle-zarr; --no-oracle-crosscheck "
+             "is for smoke tests ONLY (delta falls back to 1, report tainted)")
+    parser.add_argument(
+        "--hybrid-zero-from", dest="hybrid_zero_from", type=str, default=None,
+        help="arm A5: after all tasks complete, copy images/*/angle_00 verbatim "
+             "from this ORACLE aug zarr and set render_source='gs_hybrid0' "
+             "(requires --renderer gs)")
+    args = parser.parse_args()
+    if args.renderer == "gs" and args.oracle_crosscheck and not args.oracle_zarr:
+        parser.error("--renderer gs requires --oracle-zarr (the ORACLE aug zarr "
+                     "to copy delta from and cross-assert against, G4); pass "
+                     "--no-oracle-crosscheck only for smoke tests")
+    if args.hybrid_zero_from is not None and args.renderer != "gs":
+        parser.error("--hybrid-zero-from requires --renderer gs")
+    return args
 
 
 def parse_angles(angles_str: str) -> np.ndarray:
@@ -174,6 +247,8 @@ def open_out_zarr(
     image_size: int,
     angles_deg: np.ndarray,
     base_episode_ends: np.ndarray,
+    render_source: str,
+    accept_render_sources: Tuple[str, ...],
 ) -> zarr.Group:
     if not resume and os.path.exists(out_path):
         print(f"[prerender] --no-resume: wiping {out_path}")
@@ -204,7 +279,8 @@ def open_out_zarr(
     meta.require_dataset("state_offset", shape=(n_episodes,), chunks=(1,), dtype=np.int8,
                          fill_value=-1)
 
-    if bool(np.all(meta["episode_ends"][:] == 0)):
+    fresh = bool(np.all(meta["episode_ends"][:] == 0))
+    if fresh:
         meta["angles_deg"][:] = angles_deg
         meta["episode_ends"][:] = base_episode_ends
     else:
@@ -215,6 +291,23 @@ def open_out_zarr(
             f"{out_path} was built with different --angles "
             f"({meta['angles_deg'][:].tolist()} vs {angles_deg.tolist()}); "
             "use --no-resume to rebuild")
+
+    # provenance (G9): meta/render_source shape-(1,) string array mirrored into
+    # root.attrs['render_source'] (see module docstring for the choice). A
+    # pre-existing zarr WITHOUT the meta predates GS support and is by
+    # definition 'oracle' (backward compat) -- create the meta accordingly,
+    # then refuse to resume it under a different render source.
+    if "render_source" not in meta:
+        rs = meta.create_dataset(
+            "render_source", shape=(1,), chunks=(1,), dtype=object,
+            object_codec=numcodecs.VLenUTF8())
+        rs[0] = render_source if fresh else "oracle"
+    stored_source = str(meta["render_source"][0])
+    assert stored_source in accept_render_sources, (
+        f"{out_path} carries meta/render_source={stored_source!r} but this run "
+        f"would write {render_source!r}; refusing to mix render sources in one "
+        "zarr -- use --no-resume or a different --out")
+    root.attrs["render_source"] = stored_source
     return root
 
 
@@ -262,6 +355,7 @@ def render_episode_angle(
     support_fail_frames: Set[int],
     penetration_fail_frames: Set[int],
     on_sampled_frame: Optional[Callable[[int, dict], None]] = None,
+    gs_renderer: Optional[object] = None,
 ) -> Tuple[bool, str, int, int]:
     """Render one (episode, angle): rewrite every frame's state, run validity
     checks, write both flipped camera images at global index ep_start + t.
@@ -277,6 +371,16 @@ def render_episode_angle(
     Returns (valid, reject_reason, n_support_fail, n_penetration_fail) where
     the counts cover angle-0 failures at k == 0 and rotation-independent ones
     at k != 0.
+
+    With ``gs_renderer`` set (GS mode, plan §7) the ONLY pixel-path change is
+    that ``env.regenerate_obs_from_state`` is replaced by
+    ``gs_renderer.render(env, state_rw)``, which returns DATASET-ORIENTED uint8
+    images per zarr camera key (compose.py already applies the F2 flip -- no
+    extra flip here). render() itself does set_state_from_flattened + forward
+    (G3), so the contact-based validity checks below still read the rewritten
+    state; eef refs come from the forwarded sim (obs observables do not exist
+    without a mujoco render), and ``on_sampled_frame`` receives the GS image
+    dict instead of an obs dict.
     """
     frame_set = set(int(t) for t in frames_for_stats)
     n_support_fail = 0
@@ -295,7 +399,14 @@ def render_episode_angle(
                 return (False, f"objects_out_of_bounds: {reason}",
                         n_support_fail, n_pen_fail)
 
-        obs = env.regenerate_obs_from_state(state_rw)
+        if gs_renderer is None:
+            obs = env.regenerate_obs_from_state(state_rw)
+        else:
+            # G3: render() runs set_state_from_flattened + forward internally
+            # and never touches the mujoco renderer; env.sim below is at the
+            # rewritten state for the contact checks.
+            gs_images = gs_renderer.render(env, state_rw)
+            obs = None
 
         if args.support_check:
             ok, reason = check_support_contacts(env, addr)
@@ -320,16 +431,25 @@ def render_episode_angle(
                 else:
                     return False, reason, n_support_fail, n_pen_fail
 
-        for cam_key, obs_key in CAMERAS.items():
-            # match dataset_conversion's vertical flip of raw robosuite frames
-            img = np.flip(obs[obs_key], axis=0).astype(np.uint8)
-            out_images[cam_key][ep_start + t] = img
+        if gs_renderer is None:
+            for cam_key, obs_key in CAMERAS.items():
+                # match dataset_conversion's vertical flip of raw robosuite frames
+                img = np.flip(obs[obs_key], axis=0).astype(np.uint8)
+                out_images[cam_key][ep_start + t] = img
+        else:
+            for cam_key in CAMERAS:
+                # already dataset-oriented uint8 (compose applies F2) -- no flip
+                out_images[cam_key][ep_start + t] = gs_images[cam_key]
 
         if t in frame_set:
             if k == 0:
-                eef_refs[t] = np.asarray(obs["robot0_eef_pos"], dtype=np.float64).copy()
+                if gs_renderer is None:
+                    eef_refs[t] = np.asarray(obs["robot0_eef_pos"], dtype=np.float64).copy()
+                else:
+                    # same site_xpos the observable reads, minus the render
+                    eef_refs[t] = eef_pos_from_sim(env)
             if on_sampled_frame is not None:
-                on_sampled_frame(t, obs)
+                on_sampled_frame(t, obs if gs_renderer is None else gs_images)
     return True, "", n_support_fail, n_pen_fail
 
 
@@ -348,6 +468,37 @@ def main() -> None:
     base_images = {cam: base_root["data"][cam] for cam in CAMERAS}
     for cam, arr in base_images.items():
         assert arr.shape[0] == n_steps, f"base zarr {cam} length != episode_ends[-1]"
+
+    # theta=0 pixel gate thresholds (GS mode uses the gross-error gate, §7.4)
+    pixel_warn = PIXEL_DIFF_WARN_GS if args.renderer == "gs" else PIXEL_DIFF_WARN
+    pixel_fail = PIXEL_DIFF_FAIL_GS if args.renderer == "gs" else PIXEL_DIFF_FAIL
+
+    # ── oracle aug zarr: G4 cross-check source (GS mode only) ───────────────
+    # validity is oracle-owned: delta is COPIED from here, and valid_mask /
+    # p_base must match exactly (checked per task and at the end)
+    oracle_meta: Optional[Dict[str, np.ndarray]] = None
+    if args.renderer == "gs" and args.oracle_crosscheck:
+        assert os.path.exists(args.oracle_zarr), (
+            f"--oracle-zarr {args.oracle_zarr} does not exist; run the ORACLE "
+            "prerender first (GS mode copies delta from it and cross-asserts "
+            "validity against it, G4)")
+        oracle_root = zarr.open(args.oracle_zarr, mode="r")
+        assert np.array_equal(oracle_root["meta/episode_ends"][:], episode_ends), (
+            f"[G4] {args.oracle_zarr} meta/episode_ends != base zarr episode "
+            "ends -- the oracle aug zarr was built against a different base zarr")
+        assert np.allclose(oracle_root["meta/angles_deg"][:], angles_deg), (
+            f"[G4] {args.oracle_zarr} meta/angles_deg "
+            f"{oracle_root['meta/angles_deg'][:].tolist()} != --angles "
+            f"{angles_deg.tolist()} -- GS run must use the oracle's angle grid")
+        oracle_meta = {
+            "valid_mask": oracle_root["meta/valid_mask"][:],
+            "done_mask": oracle_root["meta/done_mask"][:],
+            "state_offset": oracle_root["meta/state_offset"][:],
+            "p_base": oracle_root["meta/p_base"][:].astype(np.float64),
+        }
+    elif args.renderer == "gs":
+        print("[prerender] WARN: --no-oracle-crosscheck: G4 asserts DISABLED and "
+              "delta falls back to 1 -- smoke tests only, report is tainted")
 
     # ── episode -> hdf5 demo (content matching; conversion scrambled order) ─
     print(f"[prerender] matching {n_episodes} zarr episodes to demos in {args.hdf5_dir} ...")
@@ -375,9 +526,15 @@ def main() -> None:
         task_to_eps = OrderedDict((t, task_to_eps[t]) for t in task_to_eps if t in selected)
     scope_eps = [e for eps in task_to_eps.values() for e in eps]
 
+    # render source this run writes; a finished A5 zarr ('gs_hybrid0') may be
+    # re-opened only when --hybrid-zero-from is passed again
+    render_source = "gs" if args.renderer == "gs" else "oracle"
+    accept_sources = (render_source,) + (
+        ("gs_hybrid0",) if args.hybrid_zero_from else ())
     out_root = open_out_zarr(
         args.out, args.resume, n_steps, n_episodes, n_angles,
-        args.image_size, angles_deg, episode_ends)
+        args.image_size, angles_deg, episode_ends,
+        render_source=render_source, accept_render_sources=accept_sources)
     out_images_by_angle = [
         {cam: out_root["images"][cam][f"angle_{k:02d}"] for cam in CAMERAS}
         for k in range(n_angles)
@@ -404,6 +561,7 @@ def main() -> None:
     per_task_pixel_diff: Dict[str, List[float]] = {}
     per_task_pixel_diff_wrist: Dict[str, List[float]] = {}
     per_task_render_err: Dict[str, List[float]] = {}
+    gs_manifest_sha1_by_task: Dict[str, str] = {}
     render_warn_count = 0
     episode_to_demo = [
         {"episode": e, "task": ep_task[e],
@@ -434,6 +592,13 @@ def main() -> None:
         report = {
             "created": datetime.datetime.now().isoformat(),
             "args": vars(args),
+            "renderer": args.renderer,
+            # current zarr value ('gs_hybrid0' once the A5 copy has run)
+            "render_source": str(out_root["meta/render_source"][0]),
+            # False taints the report: G4 asserts were skipped, delta assumed
+            "oracle_crosscheck": bool(args.oracle_crosscheck),
+            "pixel_diff_thresholds": {"warn": pixel_warn, "fail": pixel_fail},
+            "gs_manifest_sha1": gs_manifest_sha1_by_task or None,
             "angles_deg": angles_deg.tolist(),
             "tasks": list(task_to_eps.keys()),
             "n_episodes_in_scope": len(scope_eps),
@@ -464,6 +629,7 @@ def main() -> None:
                     # empirical theta=0 occupancy box: REPORT STATISTIC ONLY
                     "object_occupancy_bounds": per_task_occupancy.get(t),
                     "n_episodes": len(eps),
+                    "gs_manifest_sha1": gs_manifest_sha1_by_task.get(t),
                     "valid_per_angle": vm[np.asarray(eps)].sum(axis=0).tolist(),
                     "pixel_diff_theta0": _pct(per_task_pixel_diff.get(t, [])),
                     "pixel_diff_theta0_wrist":
@@ -486,6 +652,27 @@ def main() -> None:
     def fail(msg: str) -> None:
         write_report()
         raise RuntimeError(msg)
+
+    def check_valid_mask_vs_oracle(eps_list: List[int], where: str) -> None:
+        """G4: GS run must reproduce oracle validity exactly (validity is
+        decided in state space, never from GS output). No-op outside GS mode
+        or with --no-oracle-crosscheck."""
+        if oracle_meta is None:
+            return
+        eps_arr = np.asarray(eps_list, dtype=np.int64)
+        if not oracle_meta["done_mask"][eps_arr].all():
+            fail(f"[G4] oracle zarr {args.oracle_zarr} has unfinished "
+                 f"(episode, angle) pairs among episodes of {where} "
+                 "(meta/done_mask False) -- finish the ORACLE prerender before "
+                 "the GS pass")
+        vm = valid_mask[:][eps_arr]
+        ovm = oracle_meta["valid_mask"][eps_arr]
+        if not np.array_equal(vm, ovm):
+            bad = np.argwhere(vm != ovm)
+            examples = [(int(eps_arr[i]), int(k)) for i, k in bad[:10]]
+            fail(f"[G4] valid_mask mismatch vs oracle after {where}: "
+                 f"{len(bad)} differing (episode, angle_idx) entries, first "
+                 f"{examples} -- state-space checks must be renderer-independent")
 
     total_units = sum(len(eps) for eps in task_to_eps.values()) * n_angles
     pbar = tqdm.tqdm(total=total_units, desc="prerender", unit="ep-angle")
@@ -512,7 +699,28 @@ def main() -> None:
         pen_fail_local = 0
         pen_fail_rotind_local = 0
 
+        gs_renderer = None
         try:
+            if args.renderer == "gs":
+                # imported HERE, not at module top: oracle runs must never
+                # import gsplat/torch. compose loads gs_render_facts.json
+                # (asserts pass, G7), the per-task manifest (G9) and asserts
+                # model_xml_sha1 vs the live env on first render.
+                from oat.gsaug.compose import GSCompositeRenderer
+                gs_renderer = GSCompositeRenderer(
+                    task_assets_dir=os.path.join(args.gs_assets_dir, task_name),
+                    cameras=OrderedDict(GS_CAMERAS),
+                    resolution=args.image_size,
+                    device="cuda:0",
+                )
+                sha1 = str(gs_renderer.manifest["manifest_sha1"])
+                gs_manifest_sha1_by_task[task_name] = sha1
+                # G9: per-task provenance on the zarr itself (attrs merge so
+                # per-task shards accumulate rather than clobber)
+                stored = dict(out_root.attrs.get("gs_manifest_sha1", {}))
+                stored[task_name] = sha1
+                out_root.attrs["gs_manifest_sha1"] = stored
+
             # physical table-top xy extent from the constructed model (objects
             # are at their reset placement here); this -- inset by --xy_margin
             # -- is what rotated object centers are checked against. The arm
@@ -553,6 +761,15 @@ def main() -> None:
                 states_by_ep[e] = states
                 addr_by_ep[e] = resolve_addresses(env)
                 p_base_arr[e] = addr_by_ep[e].p_base.astype(np.float32)
+                if oracle_meta is not None:
+                    # G4: fresh resolve_addresses must agree with the oracle's
+                    # recorded rotation center to 1e-6 (same model, same base)
+                    p_err = float(np.max(np.abs(
+                        addr_by_ep[e].p_base - oracle_meta["p_base"][e])))
+                    if p_err > 1e-6:
+                        fail(f"[G4] episode {e} ({task_name}): p_base from fresh "
+                             f"resolve_addresses differs from oracle zarr by "
+                             f"{p_err:.2e} m > 1e-6 -- model/base mismatch")
                 ep_len = int(episode_ends[e] - episode_starts[e])
                 frames_by_ep[e] = sampled_frames(ep_len)
                 eef_refs_by_ep[e] = {}
@@ -566,30 +783,57 @@ def main() -> None:
                          "valid_mask[.,0]=False from a previous run; theta=0 must be "
                          "valid for every episode -- rebuild with --no-resume")
 
-            # calibrate obs/state offset delta over up to CALIB_EPISODES episodes
-            # per task, asserted consistent (probe 2 pattern; expected delta=1
-            # everywhere -- confirmed on all 10 tasks by probe_render_consistency)
-            def render_fn(state):
-                obs = env.regenerate_obs_from_state(np.asarray(state, dtype=np.float64))
-                return np.flip(obs["agentview_image"], axis=0).astype(np.uint8)
+            if args.renderer == "gs":
+                # G4: delta is COPIED from the oracle zarr's meta/state_offset,
+                # never recalibrated here -- calibration compares ORACLE renders
+                # against stored frames and is renderer-independent; both arms
+                # must index demo states identically.
+                if oracle_meta is not None:
+                    offs = [int(oracle_meta["state_offset"][e]) for e in eps]
+                    if len(set(offs)) != 1:
+                        fail(f"{task_name}: oracle meta/state_offset disagrees "
+                             f"across episodes (episode -> delta: "
+                             f"{dict(zip(eps, offs))}) -- oracle aug zarr "
+                             "inconsistent for this task")
+                    delta = offs[0]
+                    if delta not in (0, 1):
+                        fail(f"{task_name}: oracle meta/state_offset={delta} not "
+                             "in (0, 1) -- fill value -1 means the ORACLE "
+                             "prerender never processed this task; finish it "
+                             "first")
+                else:
+                    delta = 1
+                    print(f"[prerender] WARN {task_name}: --no-oracle-crosscheck "
+                          "-- assuming state offset delta=1 (measured on all 10 "
+                          "LIBERO-10 tasks); smoke tests only")
+                per_task_delta[task_name] = delta
+                for e in eps:
+                    state_offset_arr[e] = delta
+            else:
+                # calibrate obs/state offset delta over up to CALIB_EPISODES episodes
+                # per task, asserted consistent (probe 2 pattern; expected delta=1
+                # everywhere -- confirmed on all 10 tasks by probe_render_consistency)
+                def render_fn(state):
+                    obs = env.regenerate_obs_from_state(np.asarray(state, dtype=np.float64))
+                    return np.flip(obs["agentview_image"], axis=0).astype(np.uint8)
 
-            calib_eps = eps[:CALIB_EPISODES]
-            deltas = []
-            for e in calib_eps:
-                s, e_end = int(episode_starts[e]), int(episode_ends[e])
-                deltas.append(int(calibrate_state_offset(
-                    env, states_by_ep[e], base_images["agentview_rgb"][s:e_end],
-                    render_fn)))
-            if len(set(deltas)) != 1:
-                fail(f"{task_name}: inconsistent state offset across calibration "
-                     f"episodes (episode -> delta: {dict(zip(calib_eps, deltas))}) "
-                     "-- demo/zarr alignment broken for this task")
-            delta = deltas[0]
-            assert delta in (0, 1), f"unexpected state offset {delta} for {task_name}"
-            per_task_delta[task_name] = delta
-            per_task_deltas[task_name] = deltas
-            for e in eps:
-                state_offset_arr[e] = delta
+                calib_eps = eps[:CALIB_EPISODES]
+                deltas = []
+                for e in calib_eps:
+                    s, e_end = int(episode_starts[e]), int(episode_ends[e])
+                    deltas.append(int(calibrate_state_offset(
+                        env, states_by_ep[e], base_images["agentview_rgb"][s:e_end],
+                        render_fn)))
+                if len(set(deltas)) != 1:
+                    fail(f"{task_name}: inconsistent state offset across calibration "
+                         f"episodes (episode -> delta: {dict(zip(calib_eps, deltas))}) "
+                         "-- demo/zarr alignment broken for this task")
+                delta = deltas[0]
+                assert delta in (0, 1), f"unexpected state offset {delta} for {task_name}"
+                per_task_delta[task_name] = delta
+                per_task_deltas[task_name] = deltas
+                for e in eps:
+                    state_offset_arr[e] = delta
 
             # per-task empirical object-occupancy box over the theta=0 states:
             # REPORT STATISTIC ONLY -- rejection uses the physical table AABB
@@ -647,29 +891,44 @@ def main() -> None:
                     pbar.update(1)
                     continue
 
-                def on_theta0_frame(t, obs, _ep_start=ep_start):
-                    # theta=0 render vs base zarr images (uint8 mean abs diff).
-                    # Only the world-fixed agentview feeds the delta gate: the
-                    # wrist camera rides the arm, so sub-mm settling
-                    # differences shift its whole close-up image (mean MAD ~8
-                    # on contact-rich kitchen scenes) without indicating a
-                    # wrong state offset. Wrist diffs are reported only.
-                    for cam_key, obs_key in CAMERAS.items():
-                        rendered = np.flip(obs[obs_key], axis=0).astype(np.int16)
-                        stored = base_images[cam_key][_ep_start + t].astype(np.int16)
-                        mad = float(np.abs(rendered - stored).mean())
-                        if cam_key == "agentview_rgb":
-                            per_task_pixel_diff[task_name].append(mad)
-                        else:
-                            per_task_pixel_diff_wrist.setdefault(
-                                task_name, []).append(mad)
+                if gs_renderer is None:
+                    def on_theta0_frame(t, obs, _ep_start=ep_start):
+                        # theta=0 render vs base zarr images (uint8 mean abs diff).
+                        # Only the world-fixed agentview feeds the delta gate: the
+                        # wrist camera rides the arm, so sub-mm settling
+                        # differences shift its whole close-up image (mean MAD ~8
+                        # on contact-rich kitchen scenes) without indicating a
+                        # wrong state offset. Wrist diffs are reported only.
+                        for cam_key, obs_key in CAMERAS.items():
+                            rendered = np.flip(obs[obs_key], axis=0).astype(np.int16)
+                            stored = base_images[cam_key][_ep_start + t].astype(np.int16)
+                            mad = float(np.abs(rendered - stored).mean())
+                            if cam_key == "agentview_rgb":
+                                per_task_pixel_diff[task_name].append(mad)
+                            else:
+                                per_task_pixel_diff_wrist.setdefault(
+                                    task_name, []).append(mad)
+                else:
+                    def on_theta0_frame(t, gs_imgs, _ep_start=ep_start):
+                        # GS renders arrive dataset-oriented (compose applies
+                        # F2) -- compare directly, no flip. Same agentview-only
+                        # gating, but against the gross-error thresholds (§7.4).
+                        for cam_key in CAMERAS:
+                            rendered = gs_imgs[cam_key].astype(np.int16)
+                            stored = base_images[cam_key][_ep_start + t].astype(np.int16)
+                            mad = float(np.abs(rendered - stored).mean())
+                            if cam_key == "agentview_rgb":
+                                per_task_pixel_diff[task_name].append(mad)
+                            else:
+                                per_task_pixel_diff_wrist.setdefault(
+                                    task_name, []).append(mad)
 
                 ok, reason, n_support_fail, n_pen_fail = render_episode_angle(
                     env, addr, states, delta, float(thetas[0]), 0, ep_start, ep_len,
                     out_images_by_angle[0], bounds, args, frames_by_ep[e],
                     eef_refs, support_fail_frames_by_ep[e],
                     penetration_fail_frames_by_ep[e],
-                    on_sampled_frame=on_theta0_frame)
+                    on_sampled_frame=on_theta0_frame, gs_renderer=gs_renderer)
                 support_fail_local += n_support_fail
                 pen_fail_local += n_pen_fail
                 if not ok:
@@ -690,13 +949,13 @@ def main() -> None:
             diffs = per_task_pixel_diff[task_name]
             if diffs:
                 task_diff = float(np.mean(diffs))
-                if task_diff > PIXEL_DIFF_FAIL:
+                if task_diff > pixel_fail:
                     fail(f"{task_name}: theta=0 mean pixel diff vs base zarr = "
-                         f"{task_diff:.2f} > {PIXEL_DIFF_FAIL} (uint8) -- wrong state "
+                         f"{task_diff:.2f} > {pixel_fail} (uint8) -- wrong state "
                          "offset or render mismatch")
-                if task_diff > PIXEL_DIFF_WARN:
+                if task_diff > pixel_warn:
                     print(f"[prerender] WARN {task_name}: theta=0 mean pixel diff "
-                          f"{task_diff:.2f} > {PIXEL_DIFF_WARN}")
+                          f"{task_diff:.2f} > {pixel_warn}")
 
             # ── pass 2: nonzero angles ──────────────────────────────────────
             for e in eps:
@@ -712,30 +971,49 @@ def main() -> None:
                         continue
                     theta = float(thetas[k])
 
-                    def on_frame(t, obs, _theta=theta):
-                        # inline render-consistency: eef pos must map by
-                        # R_z(theta) about the base (WARN only; probe 2 gates)
-                        nonlocal render_warn_count
-                        ref = eef_refs.get(int(t))
-                        if ref is None:
-                            return
-                        expected = rotate_xy(ref, _theta, center_xy=p_base_xy)
-                        err = float(np.linalg.norm(
-                            np.asarray(obs["robot0_eef_pos"], dtype=np.float64) - expected))
-                        per_task_render_err[task_name].append(err)
-                        if err > RENDER_WARN_M:
-                            render_warn_count += 1
-                            if render_warn_count <= 10:
-                                print(f"[prerender] WARN render-consistency: ep {e} "
-                                      f"angle {angles_deg[k]:+.0f} frame {t}: "
-                                      f"eef err {err:.4f} m")
+                    if gs_renderer is None:
+                        def on_frame(t, obs, _theta=theta):
+                            # inline render-consistency: eef pos must map by
+                            # R_z(theta) about the base (WARN only; probe 2 gates)
+                            nonlocal render_warn_count
+                            ref = eef_refs.get(int(t))
+                            if ref is None:
+                                return
+                            expected = rotate_xy(ref, _theta, center_xy=p_base_xy)
+                            err = float(np.linalg.norm(
+                                np.asarray(obs["robot0_eef_pos"], dtype=np.float64) - expected))
+                            per_task_render_err[task_name].append(err)
+                            if err > RENDER_WARN_M:
+                                render_warn_count += 1
+                                if render_warn_count <= 10:
+                                    print(f"[prerender] WARN render-consistency: ep {e} "
+                                          f"angle {angles_deg[k]:+.0f} frame {t}: "
+                                          f"eef err {err:.4f} m")
+                    else:
+                        def on_frame(t, _gs_imgs, _theta=theta):
+                            # same check, eef from the forwarded sim (G3): obs
+                            # observables do not exist without a mujoco render
+                            nonlocal render_warn_count
+                            ref = eef_refs.get(int(t))
+                            if ref is None:
+                                return
+                            expected = rotate_xy(ref, _theta, center_xy=p_base_xy)
+                            err = float(np.linalg.norm(
+                                eef_pos_from_sim(env) - expected))
+                            per_task_render_err[task_name].append(err)
+                            if err > RENDER_WARN_M:
+                                render_warn_count += 1
+                                if render_warn_count <= 10:
+                                    print(f"[prerender] WARN render-consistency: ep {e} "
+                                          f"angle {angles_deg[k]:+.0f} frame {t}: "
+                                          f"eef err {err:.4f} m")
 
                     ok, reason, n_rot_indep, n_pen_rot_indep = render_episode_angle(
                         env, addr, states, delta, theta, k, ep_start, ep_len,
                         out_images_by_angle[k], bounds, args, frames_by_ep[e],
                         eef_refs, support_fail_frames_by_ep[e],
                         penetration_fail_frames_by_ep[e],
-                        on_sampled_frame=on_frame)
+                        on_sampled_frame=on_frame, gs_renderer=gs_renderer)
                     support_fail_rotind_local += n_rot_indep
                     pen_fail_rotind_local += n_pen_rot_indep
                     if not ok:
@@ -773,6 +1051,9 @@ def main() -> None:
             print(f"[prerender] note {task_name}: {pen_fail_rotind_local} k!=0 frames "
                   "failed the penetration check rotation-independently (also failed "
                   "at theta=0; statistic only, never rejects)")
+        # G4: the completed task's valid_mask rows must equal the oracle's
+        # (no-op outside GS mode / with --no-oracle-crosscheck)
+        check_valid_mask_vs_oracle(eps, f"task {task_name}")
 
     pbar.close()
 
@@ -781,6 +1062,34 @@ def main() -> None:
     bad = [e for e in scope_eps if not vm0[e]]
     if bad:
         fail(f"theta=0 not valid for episodes {bad}")
+    # G4 final invariant over everything in scope
+    check_valid_mask_vs_oracle(scope_eps, "final invariant")
+
+    # ── arm A5 assembly: theta=0 images verbatim from the oracle zarr ───────
+    if args.hybrid_zero_from:
+        hz_root = zarr.open(args.hybrid_zero_from, mode="r")
+        assert np.array_equal(hz_root["meta/episode_ends"][:], episode_ends), (
+            f"--hybrid-zero-from {args.hybrid_zero_from} meta/episode_ends != "
+            "this run's episode_ends -- different base zarr, refusing to copy")
+        assert float(hz_root["meta/angles_deg"][0]) == 0.0, (
+            f"--hybrid-zero-from {args.hybrid_zero_from} angle_00 is "
+            f"{float(hz_root['meta/angles_deg'][0])} deg, not 0 -- refusing")
+        print(f"[prerender] hybrid0: copying images/*/angle_00 verbatim from "
+              f"{args.hybrid_zero_from}")
+        for cam_key in CAMERAS:
+            src = hz_root["images"][cam_key]["angle_00"]
+            dst = out_root["images"][cam_key]["angle_00"]
+            assert src.shape == dst.shape and src.dtype == dst.dtype, (
+                f"hybrid0 {cam_key}: shape/dtype mismatch {src.shape}/{src.dtype}"
+                f" vs {dst.shape}/{dst.dtype} (different --image_size?)")
+            # per-episode slabs; image chunks are (1, H, W, 3) so any episode
+            # boundary is chunk-aligned
+            for e in tqdm.trange(n_episodes, desc=f"hybrid0 {cam_key}",
+                                 unit="ep", leave=False):
+                s, e_end = int(episode_starts[e]), int(episode_ends[e])
+                dst[s:e_end] = src[s:e_end]
+        out_root["meta/render_source"][0] = "gs_hybrid0"
+        out_root.attrs["render_source"] = "gs_hybrid0"
 
     write_report()
     dm = done_mask[:]
