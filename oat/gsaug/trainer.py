@@ -412,7 +412,7 @@ def fit_static(bundle: CaptureBundle, component: str, out_path: str,
             reset_opa(params, optimizers, state,
                       value=float(cfg["reset_opacity"]))
         for k, v in (("total", loss), ("l1", l1), ("ssim", sloss), ("sil", sil)):
-            recent[k].append(float(v))
+            recent[k].append(float(v.detach()))
         if cfg["log_every"] and (step + 1) % int(cfg["log_every"]) == 0:
             print(f"[trainer] {bundle.component} step {step + 1}/{iters}: "
                   f"loss {np.mean(recent['total']):.4f} "
@@ -474,8 +474,8 @@ def fit_static(bundle: CaptureBundle, component: str, out_path: str,
         "frame": frame, "p_capture": p_cap, "q_capture": q_cap,
         "task": bundle.task, "component": bundle.component,
         "model_xml_sha1": bundle.model_xml_sha1,
-        "versions": {"gsplat": gsplat.__version__,
-                     "torch": torch.__version__},
+        "versions": {"gsplat": str(gsplat.__version__),
+                     "torch": str(torch.__version__)},
         "train_args": train_args, "metrics": metrics,
     }
     if kind == "object":

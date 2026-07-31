@@ -361,7 +361,7 @@ def fit_robot(bundle: CaptureBundle, out_path: str,
             opt.step()
             opt.zero_grad(set_to_none=True)
         for k, v in (("total", loss), ("l1", l1), ("ssim", sloss), ("sil", sil)):
-            recent[k].append(float(v))
+            recent[k].append(float(v.detach()))
 
         if step + 1 == int(cfg["prune_iter"]):  # single prune (plan §6.4)
             with torch.no_grad():
@@ -467,8 +467,8 @@ def fit_robot(bundle: CaptureBundle, out_path: str,
         "task": bundle.task, "component": "robot",
         "model_xml_sha1": bundle.model_xml_sha1,
         "canonical_config_index": canonical_index,
-        "versions": {"gsplat": gsplat.__version__,
-                     "torch": torch.__version__},
+        "versions": {"gsplat": str(gsplat.__version__),
+                     "torch": str(torch.__version__)},
         "train_args": train_args, "metrics": metrics,
     }
     asset = GaussianAsset(
