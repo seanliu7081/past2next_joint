@@ -26,7 +26,8 @@ validated two ways:
 * once per capture (F1 pattern): :class:`PoseValidator` checks the FULL
   (K, c2w) chain against rendered pixels — a seg-projected landmark (small
   centered-primitive geom, ≤ 1 px) where one exists, else backprojected
-  table-top depth planarity (F5 pattern, median ≤ 5 mm).
+  depth planarity (F5 pattern, median ≤ 5 mm) against the table-top box or,
+  when only a mesh table is visible, the 'floor' plane geom.
 
 Renderer facts (G7): the raw ``mujoco.Renderer`` needs the measured F2b
 visualization flags (:func:`scene_option_from_facts`) for parity with the
@@ -49,8 +50,8 @@ import ``CaptureBundle`` without a GL stack.
 import json
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -69,6 +70,7 @@ VIEW_FILE_FMT = "view_{:04d}"
 # mujoco enum values (stable across versions; asserted lazily against the
 # live enums where mujoco is imported).
 _MJ_OBJ_GEOM = 5          # mujoco.mjtObj.mjOBJ_GEOM
+_MJ_GEOM_PLANE = 0        # mujoco.mjtGeom.mjGEOM_PLANE
 _MJ_GEOM_BOX = 6          # mujoco.mjtGeom.mjGEOM_BOX
 # geom types whose frame origin is the visual center — usable as landmarks
 _CENTERED_GEOM_TYPES = (2, 3, 4, 5, 6)  # sphere, capsule, ellipsoid, cylinder, box
@@ -171,13 +173,92 @@ def orbit_poses(lookat: Sequence[float], radius: float,
     return poses
 
 
-def background_orbit_poses(lookat: Sequence[float], radius: float) -> List[OrbitPose]:
+def background_orbit_poses(lookat: Sequence[float], radius: float,
+                           radius_for_azimuth: Optional[Callable[[float], float]]
+                           = None) -> List[OrbitPose]:
     """Plan §5.1 background orbit: rings at 25°/50° × 24 azimuths + 8 top-down
-    (80°) = 56 views."""
+    (80°) = 56 views.
+
+    ``radius_for_azimuth`` (az_deg → radius m), when given, replaces each
+    pose's distance with a per-azimuth value — the interior-safe wall clamp
+    (:func:`wall_distance_2d` + :func:`interior_orbit_radius`): LIBERO rooms
+    can be smaller than the requested orbit, leaving cameras outside staring
+    at wall backfaces."""
     poses = orbit_poses(lookat, radius, (25.0, 50.0), 24)
     poses += orbit_poses(lookat, radius, (80.0,), 8, az_offset_deg=10.0)
     assert len(poses) == 56
+    if radius_for_azimuth is not None:
+        poses = [replace(p, distance=float(radius_for_azimuth(p.azimuth_deg)))
+                 for p in poses]
+        assert all(p.distance > 0 for p in poses), "non-positive clamped radius"
     return poses
+
+
+def wall_distance_2d(model, data, lookat_xy: Sequence[float],
+                     az_deg: float) -> float:
+    """Distance (m) from the lookat, measured in the xy plane toward the
+    CAMERA position of an orbit view at azimuth ``az_deg``, to the nearest
+    wall geom's 2D AABB.
+
+    The free camera sits at ``eye = lookat − distance · forward`` with
+    ``forward_xy ∝ [cos az, sin az]``, so the camera direction from the lookat
+    is ``−forward``: the ray marched here is ``lookat_xy + t · (−[cos az,
+    sin az])``, t ≥ 0. Wall geoms are box geoms whose geom OR body name
+    contains 'wall'; each contributes the axis-aligned xy box
+    ``data.geom_xpos ± |R| @ geom_size``. Returns +inf when no wall geom
+    intersects the ray (callers min() against a requested radius)."""
+    o = np.asarray(lookat_xy, dtype=np.float64).reshape(-1)[:2]
+    az = math.radians(float(az_deg))
+    d = -np.array([math.cos(az), math.sin(az)])  # toward the camera, xy unit
+    geom_type = np.asarray(model.geom_type)
+    geom_bodyid = np.asarray(model.geom_bodyid)
+    best = math.inf
+    for gid in range(int(model.ngeom)):
+        if int(geom_type[gid]) != _MJ_GEOM_BOX:
+            continue
+        geom_name = (model.geom_id2name(int(gid)) or "").lower()
+        body_name = (model.body_id2name(int(geom_bodyid[gid])) or "").lower()
+        if "wall" not in geom_name and "wall" not in body_name:
+            continue
+        center = np.asarray(data.geom_xpos[gid], dtype=np.float64)
+        R = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
+        ext = (np.abs(R) @ np.asarray(model.geom_size[gid], dtype=np.float64))[:2]
+        mn, mx = center[:2] - ext, center[:2] + ext
+        # 2D slab ray/AABB intersection along o + t*d
+        t_enter, t_exit, hit = -math.inf, math.inf, True
+        for ax in range(2):
+            if abs(d[ax]) < 1e-12:
+                if not (mn[ax] <= o[ax] <= mx[ax]):
+                    hit = False
+                    break
+                continue
+            t1 = (mn[ax] - o[ax]) / d[ax]
+            t2 = (mx[ax] - o[ax]) / d[ax]
+            t_enter = max(t_enter, min(t1, t2))
+            t_exit = min(t_exit, max(t1, t2))
+        if not hit or t_enter > t_exit or t_exit < 0:
+            continue
+        best = min(best, t_enter if t_enter >= 0 else t_exit)
+    return best
+
+
+def interior_orbit_radius(requested_r: float, wall_dist_m: float,
+                          table_half_diag_m: float,
+                          wall_margin_m: float = 0.30,
+                          floor_scale: float = 1.05,
+                          floor_pad_m: float = 0.10) -> float:
+    """Interior-safe per-azimuth background orbit radius:
+    ``min(requested_r, wall_dist − wall_margin)``, floored at
+    ``floor_scale · (table_half_diag + floor_pad)`` so the camera never sits
+    over the table itself; when the floor exceeds the wall clamp the wall
+    clamp wins (camera close to the wall but still inside the room)."""
+    r_wall = float(wall_dist_m) - float(wall_margin_m)
+    floor = float(floor_scale) * (float(table_half_diag_m) + float(floor_pad_m))
+    r = min(max(min(float(requested_r), r_wall), floor), r_wall)
+    assert r > 0, (
+        f"interior orbit radius {r:.3f} m <= 0 (wall {wall_dist_m:.3f} m, "
+        f"margin {wall_margin_m} m) — lookat essentially on a wall")
+    return r
 
 
 def object_orbit_poses(lookat: Sequence[float], radius: float) -> List[OrbitPose]:
@@ -344,18 +425,36 @@ def assert_free_camera_pose(scene, c2w_expected: np.ndarray, tag: str,
 # ── once-per-capture pixel-chain validation (F1/F5 pattern) ─────────────────
 
 def seg_landmark_error_px(model, data, K: np.ndarray, c2w: np.ndarray,
-                          seg: np.ndarray, min_px: int = 20, max_px_count: int = 5000,
-                          max_candidates: int = 8) -> float:
+                          seg: np.ndarray, depth: np.ndarray,
+                          min_px: int = 20, max_px_count: int = 5000,
+                          max_candidates: int = 8, max_rbound_m: float = 0.2,
+                          min_fill_frac: float = 0.15) -> float:
     """Project centered-primitive geom centers through (K, w2c) and compare
     against their seg-mask centroids (F1 pattern); returns the best (minimum)
     error in pixels over up to ``max_candidates`` fully-visible small geoms.
+
+    Mask-centroid ≈ projected-center only holds for PHYSICALLY small, mostly
+    visible geoms, so candidates must additionally pass:
+
+    * ``geom_rbound <= max_rbound_m`` — room-scale boxes (walls, table tops)
+      can leave a small in-frame sliver that passes the pixel-count and
+      frame-crop filters while its centroid has nothing to do with the
+      projected geom center (measured 695 px on 'wall_rightcorner_visual');
+    * a projected-size consistency guard against occlusion-truncated slivers:
+      with r_px = fy · rbound / depth(centroid), the mask must cover at least
+      ``min_fill_frac · π · r_px²`` pixels (loose lower bound on the visible
+      fraction of the geom's bounding disk).
 
     Raises ``LookupError`` when the view contains no usable landmark (all-mesh
     scenes) — callers fall back to :func:`table_depth_error_m`.
     """
     H, W = seg.shape
+    depth = np.asarray(depth)
+    assert depth.shape == seg.shape, (depth.shape, seg.shape)
     w2c = np.linalg.inv(np.asarray(c2w, dtype=np.float64))
     geom_type = np.asarray(model.geom_type)
+    geom_rbound = np.asarray(model.geom_rbound)
+    fy = float(np.asarray(K, dtype=np.float64)[1, 1])
     ids, counts = np.unique(seg[seg >= 0], return_counts=True)
     order = np.argsort(counts)  # smallest geoms first: closest to point landmarks
     best: Optional[float] = None
@@ -366,10 +465,19 @@ def seg_landmark_error_px(model, data, K: np.ndarray, c2w: np.ndarray,
             continue
         if int(geom_type[gid]) not in _CENTERED_GEOM_TYPES:
             continue  # mesh/plane origins are not visual centers
+        if float(geom_rbound[gid]) > max_rbound_m:
+            continue  # room/table-scale primitive: sliver centroid ≠ center
         ys, xs = np.nonzero(seg == gid)
         if xs.min() < 2 or ys.min() < 2 or xs.max() >= W - 2 or ys.max() >= H - 2:
             continue  # cropped by the frame → centroid biased
         centroid = np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+        d = float(depth[int(np.clip(round(ys.mean()), 0, H - 1)),
+                        int(np.clip(round(xs.mean()), 0, W - 1))])
+        if not (np.isfinite(d) and d > 1e-6):
+            continue
+        r_px = fy * float(geom_rbound[gid]) / d
+        if cnt < min_fill_frac * math.pi * r_px * r_px:
+            continue  # mostly occluded → centroid biased
         uv = project(K, w2c, np.asarray(data.geom_xpos[gid], dtype=np.float64))
         if not np.all(np.isfinite(uv)):
             continue
@@ -381,6 +489,28 @@ def seg_landmark_error_px(model, data, K: np.ndarray, c2w: np.ndarray,
     if best is None:
         raise LookupError("no centered-primitive landmark geom in this view")
     return best
+
+
+def _median_plane_dz_m(K: np.ndarray, c2w: np.ndarray, seg: np.ndarray,
+                       depth: np.ndarray, gid: int, plane_z: float,
+                       min_px: int, max_samples: int) -> Optional[float]:
+    """Backproject ``seg == gid`` pixels through (K, c2w) with metric z-depth
+    (M0) and return the median |world z − plane_z| in meters (None if too few
+    finite-depth pixels)."""
+    ys, xs = np.nonzero(seg == gid)
+    sel = np.linspace(0, len(xs) - 1, min(max_samples, len(xs))).astype(int)
+    ys, xs = ys[sel], xs[sel]
+    d = depth[ys, xs].astype(np.float64)
+    finite = np.isfinite(d)
+    if finite.sum() < min_px // 2:
+        return None
+    ys, xs, d = ys[finite], xs[finite], d[finite]
+    uv1 = np.stack([xs + 0.5, ys + 0.5, np.ones_like(xs, dtype=np.float64)], axis=1)
+    rays = uv1 @ np.linalg.inv(np.asarray(K, dtype=np.float64)).T  # z-component 1
+    pts_c = rays * d[:, None]  # metric z-depth (M0)
+    c2w = np.asarray(c2w, dtype=np.float64)
+    pts_w = pts_c @ c2w[:3, :3].T + c2w[:3, 3]
+    return float(np.median(np.abs(pts_w[:, 2] - float(plane_z))))
 
 
 def table_depth_error_m(model, data, K: np.ndarray, c2w: np.ndarray,
@@ -412,21 +542,41 @@ def table_depth_error_m(model, data, K: np.ndarray, c2w: np.ndarray,
     R = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
     size = np.asarray(model.geom_size[gid], dtype=np.float64)
     top_z = float(center[2] + (np.abs(R) @ size)[2])
+    return _median_plane_dz_m(K, c2w, seg, depth, gid, top_z, min_px, max_samples)
 
-    ys, xs = np.nonzero(seg == gid)
-    sel = np.linspace(0, len(xs) - 1, min(max_samples, len(xs))).astype(int)
-    ys, xs = ys[sel], xs[sel]
-    d = depth[ys, xs].astype(np.float64)
-    finite = np.isfinite(d)
-    if finite.sum() < min_px // 2:
+
+def floor_depth_error_m(model, data, K: np.ndarray, c2w: np.ndarray,
+                        seg: np.ndarray, depth: np.ndarray,
+                        min_px: int = 300, max_samples: int = 2000
+                        ) -> Optional[float]:
+    """F5-pattern fallback for scenes with NO visible 'table' box geom (LIBERO
+    living rooms: the visible table is a MESH whose top sits ~11 mm off the
+    hidden group-0 collision boxes — measured, so the box plane cannot gate a
+    mesh surface): backproject the largest visible world-horizontal 'floor'
+    PLANE geom's pixels and compare world z against the plane's analytic
+    height. An exact analytic plane with no side faces or legs — measured
+    0.2–1.3 mm median on a correct chain. Returns None when no such floor
+    plane is visible."""
+    geom_type = np.asarray(model.geom_type)
+    geom_bodyid = np.asarray(model.geom_bodyid)
+    ids, counts = np.unique(seg[seg >= 0], return_counts=True)
+    cands = []
+    for gid, cnt in zip(ids.tolist(), counts.tolist()):
+        if cnt < min_px or int(geom_type[gid]) != _MJ_GEOM_PLANE:
+            continue
+        body_name = (model.body_id2name(int(geom_bodyid[gid])) or "").lower()
+        geom_name = (model.geom_id2name(int(gid)) or "").lower()
+        if "floor" not in body_name and "floor" not in geom_name:
+            continue
+        R = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
+        if R[2, 2] < 0.999:
+            continue  # not a world-horizontal plane: no analytic z height
+        cands.append((int(cnt), int(gid)))
+    if not cands:
         return None
-    ys, xs, d = ys[finite], xs[finite], d[finite]
-    uv1 = np.stack([xs + 0.5, ys + 0.5, np.ones_like(xs, dtype=np.float64)], axis=1)
-    rays = uv1 @ np.linalg.inv(np.asarray(K, dtype=np.float64)).T  # z-component 1
-    pts_c = rays * d[:, None]  # metric z-depth (M0)
-    c2w = np.asarray(c2w, dtype=np.float64)
-    pts_w = pts_c @ c2w[:3, :3].T + c2w[:3, 3]
-    return float(np.median(np.abs(pts_w[:, 2] - top_z)))
+    _, gid = max(cands)
+    plane_z = float(np.asarray(data.geom_xpos[gid], dtype=np.float64)[2])
+    return _median_plane_dz_m(K, c2w, seg, depth, gid, plane_z, min_px, max_samples)
 
 
 class PoseValidator:
@@ -435,9 +585,10 @@ class PoseValidator:
 
     Feed every view via :meth:`try_view` while its sim state is still current;
     the first view with a seg landmark decides (hard ≤ ``landmark_max_px``).
-    If NO view offers a landmark (all-mesh close-ups), the best table-top
-    depth-planarity result over downward views (elevation ≥ 30°) gates at
-    ``table_max_med_m`` in :meth:`finalize`."""
+    If NO view offers a landmark (all-mesh close-ups), the best depth-planarity
+    result over downward views (elevation ≥ 30°) gates at ``table_max_med_m``
+    in :meth:`finalize` — table-top where a 'table' box geom is visible, else
+    the 'floor' plane geom (living-room scenes render only a MESH table)."""
 
     def __init__(self, model, K: np.ndarray,
                  landmark_max_px: float = _LANDMARK_MAX_PX,
@@ -448,7 +599,8 @@ class PoseValidator:
         self.landmark_max_px = float(landmark_max_px)
         self.table_max_med_m = float(table_max_med_m)
         self.result: Optional[dict] = None
-        self._best_table: Optional[Tuple[float, int]] = None  # (med_m, view)
+        # best depth-planarity fallback so far: (med_m, view, method)
+        self._best_table: Optional[Tuple[float, int, str]] = None
         self._table_evals_left = int(max_table_evals)
 
     @property
@@ -460,7 +612,7 @@ class PoseValidator:
         if self.done:
             return
         try:
-            err = seg_landmark_error_px(self.model, data, self.K, c2w, seg)
+            err = seg_landmark_error_px(self.model, data, self.K, c2w, seg, depth)
         except LookupError:
             err = None
         if err is not None:
@@ -477,28 +629,34 @@ class PoseValidator:
         if elevation_deg >= 30.0 and self._table_evals_left > 0:
             self._table_evals_left -= 1
             med = table_depth_error_m(self.model, data, self.K, c2w, seg, depth)
+            method = "table_depth"
+            if med is None:
+                med = floor_depth_error_m(self.model, data, self.K, c2w, seg,
+                                          depth)
+                method = "floor_depth"
             if med is not None and (self._best_table is None
                                     or med < self._best_table[0]):
-                self._best_table = (float(med), int(view_idx))
+                self._best_table = (float(med), int(view_idx), method)
 
     def finalize(self, tag: str) -> dict:
         if self.result is not None:
             return self.result
         if self._best_table is not None:
-            med, view = self._best_table
+            med, view, method = self._best_table
             if med > self.table_max_med_m:
                 raise AssertionError(
-                    f"{tag}: no seg landmark available and table-top depth "
+                    f"{tag}: no seg landmark available and {method} "
                     f"backprojection off-plane by median {med * 1e3:.1f} mm > "
                     f"{self.table_max_med_m * 1e3:.0f} mm (view {view}) — the "
                     f"recorded (K, c2w) chain does not match rendered pixels (G7).")
-            self.result = {"method": "table_depth", "med_err_m": med, "view": view}
+            self.result = {"method": method, "med_err_m": med, "view": view}
             return self.result
         raise AssertionError(
             f"{tag}: could not validate the recorded camera chain against pixels "
             f"— no centered-primitive landmark in any view AND no visible "
-            f"'table' box geom in any downward view. Refusing unvalidated "
-            f"captures (G7); widen the orbit or add a validation view.")
+            f"'table' box geom or 'floor' plane geom in any downward view. "
+            f"Refusing unvalidated captures (G7); widen the orbit or add a "
+            f"validation view.")
 
 
 # ── state edits & hide mechanisms (facts F4) ────────────────────────────────
@@ -684,11 +842,26 @@ def table_top_z(model, data, addr, z_below: float = 0.30,
     return max(tops)
 
 
+def canonical_model_xml(env) -> str:
+    """The compiled model XML with render-buffer attributes stripped.
+
+    G9 binds assets to the task SCENE, not to the offscreen framebuffer size:
+    robosuite serializes ``<global offwidth/offheight>`` only when non-default,
+    so a 512² capture env and a 128² composite-render env differ by exactly
+    that one line (measured on LIVING_ROOM_SCENE2). Hashing the raw XML made
+    the G9 gate reject its own assets at render time."""
+    import re
+    xml = env.sim.model.get_xml()
+    xml = re.sub(r'\s+off(width|height)="\d+"', "", xml)
+    xml = re.sub(r'\n\s*<global\s*/>', "", xml)
+    return xml
+
+
 def model_xml_sha1(env) -> str:
     """THE model-hash recipe (G9) — pinned; every consumer compares this exact
-    quantity: sha1 over the compiled model XML string."""
+    quantity: sha1 over the CANONICALIZED model XML (see canonical_model_xml)."""
     import hashlib
-    return hashlib.sha1(env.sim.model.get_xml().encode()).hexdigest()
+    return hashlib.sha1(canonical_model_xml(env).encode()).hexdigest()
 
 
 # ── capture file IO ──────────────────────────────────────────────────────────

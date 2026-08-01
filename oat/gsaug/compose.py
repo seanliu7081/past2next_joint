@@ -55,9 +55,12 @@ from oat.gsaug.gaussian_asset import GaussianAsset
 
 def model_xml_sha1_of(env) -> str:
     """The pinned model-hash recipe (G9). Use THIS everywhere the hash is
-    compared (capture manifest, renderer, prerender): sha1 over the live
-    model's serialized XML."""
-    return hashlib.sha1(env.sim.model.get_xml().encode()).hexdigest()
+    compared (capture manifest, renderer, prerender). Delegates to
+    ``oat.gsaug.capture.model_xml_sha1`` — sha1 over the CANONICALIZED XML
+    (off-buffer attributes stripped so capture-at-512 and render-at-128 envs
+    of the same scene hash identically)."""
+    from oat.gsaug.capture import model_xml_sha1
+    return model_xml_sha1(env)
 
 
 @dataclass

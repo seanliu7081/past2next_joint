@@ -4,8 +4,10 @@ background, each movable object, and the robot from a live LIBERO ControlEnv.
 Per task (G1, asset-based reconstruction):
   * background — movables graveyarded (F4-a), robot hidden per facts F4
     (alpha-0, or present-at-stow + per-pixel masks if robot_hide=='masked');
-    56 views (rings 25°/50° × 24 azimuths + 8 top-down), radius 1.6× the
-    table-AABB diagonal, lookat = table center.
+    up to 56 views (rings 25°/50° × 24 azimuths + 8 top-down), requested
+    radius 1.6× the table-AABB diagonal clamped per-azimuth inside the room
+    walls (LIBERO rooms can be smaller than that orbit), lookat = table
+    center; point-blank wall views are skipped, >= 32 usable views required.
   * objects — one capture per movable free joint (names from
     resolve_addresses): solo on the table (others graveyarded, robot hidden),
     floated +z so the −20° ring sees the underside; 48 close-radius views.
@@ -70,6 +72,11 @@ JOINT1_SHIFT_PAIRS = ((20.0, -20.0), (30.0, -30.0))  # alternated per config
 JOINT1_SHIFT_MARGIN = 0.05    # rad, matches the validity check margin
 MIN_OBJECT_PIXELS = 30        # object visible in EVERY object-capture view
 MIN_ROBOT_PIXELS = 100        # robot visible in EVERY robot-capture view
+BG_POINT_BLANK_DEPTH_M = 0.5  # background view skip rule: pixels closer than
+BG_POINT_BLANK_FRAC = 0.60    # ...this over this fraction = wall/backface view
+MIN_BACKGROUND_VIEWS = 32     # usable background views after the skip rule
+ROBOT_RADIUS_SHRINK = 0.8     # robot-view retry: pull the camera in by this
+ROBOT_MIN_RADIUS = 1.0        # ...per step, down to the orbit's radius floor
 MIN_FINITE_DEPTH_FRAC = 0.99  # plan §5.1 fail-fast
 MAX_ROBOT_POOL = 8000         # FPS pool cap (subsampled with --seed above this)
 GRIPPER_SPAN_TOL = 0.05       # fraction of the demo gripper range per joint
@@ -255,11 +262,30 @@ def capture_background(ctx: TaskContext) -> None:
     out_dir = ctx.out_dir("background")
     tag = f"{ctx.task_name}/background"
 
+    # variable keep-count (skip rule below): stale view files from a previous
+    # run must not outlive the new transforms.json
+    for stale in glob.glob(os.path.join(out_dir, "view_*")):
+        os.remove(stale)
+
     cap.set_flat_state(env, ctx.base_state)
     cap.graveyard_movables(env, addr)  # F4-a
 
-    radius = 1.6 * ctx.table_diag
-    poses = cap.background_orbit_poses(ctx.table_lookat, radius)
+    # Interior-safe orbit: the plan radius (1.6× table diag) can exceed the
+    # room — LIVING_ROOM walls sit ~1.5 m (+x) from the lookat while the
+    # requested radius is ~3.3 m, leaving most ring cameras OUTSIDE the room
+    # staring at wall backfaces. Clamp per azimuth to wall distance − 0.30 m,
+    # floored so the camera never sits over the table itself.
+    model, data = env.sim.model, env.sim.data
+    requested_radius = 1.6 * ctx.table_diag
+    lookat_xy = np.asarray(ctx.table_lookat[:2], dtype=np.float64)
+
+    def interior_radius(az_deg: float) -> float:
+        wall_d = cap.wall_distance_2d(model, data, lookat_xy, az_deg)
+        return cap.interior_orbit_radius(requested_radius, wall_d,
+                                         ctx.table_diag / 2.0)
+
+    poses = cap.background_orbit_poses(ctx.table_lookat, requested_radius,
+                                       radius_for_azimuth=interior_radius)
 
     masks_dir_name: Optional[str] = None
     hide: Optional[cap.RobotHide] = None
@@ -280,29 +306,53 @@ def capture_background(ctx: TaskContext) -> None:
 
     validator = cap.PoseValidator(env.sim.model, ctx.K)
     views_meta = []
+    view_radii = []
+    skipped_views = []
     try:
         for i, pose in enumerate(tqdm.tqdm(poses, desc=tag, unit="view")):
-            vtag = f"{tag} view {i}"
+            k = len(views_meta)  # kept-view index = on-disk index
+            vtag = f"{tag} view {k} (orbit pose {i})"
             rgb, depth, seg, c2w = ctx.render_orbit_view(pose, vtag)
+            frac_close = float((depth < BG_POINT_BLANK_DEPTH_M).mean())
+            if frac_close > BG_POINT_BLANK_FRAC:
+                # point-blank wall/backface (camera pinched against a wall):
+                # do not save, do not count.
+                skipped_views.append({
+                    "orbit_pose_idx": i,
+                    "azimuth_deg": float(pose.azimuth_deg),
+                    "elevation_deg": float(pose.elevation_deg),
+                    "radius": float(pose.distance),
+                    "frac_depth_below_0p5m": frac_close})
+                continue
             ctx.check_view(vtag, depth, seg, forbidden, forbidden_what)
-            validator.try_view(env.sim.data, c2w, seg, depth, i,
+            validator.try_view(env.sim.data, c2w, seg, depth, k,
                                pose.elevation_deg, tag)
-            prefix = cap.write_view_files(out_dir, i, rgb, depth, seg)
+            prefix = cap.write_view_files(out_dir, k, rgb, depth, seg)
             if masks_dir_name:
-                cap.write_mask_file(os.path.join(out_dir, masks_dir_name), i,
+                cap.write_mask_file(os.path.join(out_dir, masks_dir_name), k,
                                     np.isin(seg, ctx.robot_gids))
             views_meta.append({"file_prefix": prefix,
                                "c2w_opencv": c2w.tolist(),
                                "cam_params": pose.cam_params()})
+            view_radii.append(float(pose.distance))
     finally:
         if hide is not None:
             hide.restore()
 
     validation = validator.finalize(tag)
-    assert len(views_meta) == 56, f"{tag}: {len(views_meta)} views != 56"
+    n_requested, n_kept = len(poses), len(views_meta)
+    assert n_kept >= MIN_BACKGROUND_VIEWS, (
+        f"{tag}: only {n_kept}/{n_requested} background views usable after "
+        f"skipping {len(skipped_views)} point-blank wall views "
+        f"(>{BG_POINT_BLANK_FRAC:.0%} of pixels closer than "
+        f"{BG_POINT_BLANK_DEPTH_M} m); need >= {MIN_BACKGROUND_VIEWS} — "
+        f"lookat/wall clamp misconfigured for this room")
 
     extra = {"capture_args": ctx.capture_args(
-        radius=float(radius), lookat=ctx.table_lookat.tolist(),
+        radius_requested=float(requested_radius),
+        n_views_requested=n_requested, n_views_kept=n_kept,
+        view_radii=view_radii, skipped_views=skipped_views,
+        lookat=ctx.table_lookat.tolist(),
         table_diag=ctx.table_diag, table_top_z=ctx.table_top_z,
         table_geoms=ctx.table_geoms)}
     if masks_dir_name:
@@ -316,8 +366,10 @@ def capture_background(ctx: TaskContext) -> None:
         extra["robot_stow_qpos"] = robot_qpos
     cap.write_transforms(out_dir, ctx.base_transforms(
         "background", views_meta, validation, **extra))
-    print(f"[capture] {tag}: 56 views OK "
-          f"(validation: {validation}) -> {out_dir}")
+    print(f"[capture] {tag}: {n_kept}/{n_requested} views OK "
+          f"({len(skipped_views)} point-blank wall views skipped, radii "
+          f"[{min(view_radii):.2f}, {max(view_radii):.2f}] m; "
+          f"validation: {validation}) -> {out_dir}")
 
 
 # ── objects ──────────────────────────────────────────────────────────────────
@@ -343,10 +395,33 @@ def capture_object(ctx: TaskContext, joint_name: str) -> None:
     # float high enough that the -20 deg ring stays above the table top.
     mn, mx = cap.geoms_world_aabb(model, env.sim.data, obj_gids)
     diag = float(np.linalg.norm(mx - mn))
-    half_z = float(mx[2] - mn[2]) / 2.0
-    radius = max(4.0 * diag, 0.35)
+    radius = radius_requested = max(4.0 * diag, 0.35)
+    # interior clamp (same wall logic as the background orbit): large objects
+    # (e.g. the basket, diag 0.57 m -> 4x = 2.27 m) would put low-ring cameras
+    # OUTSIDE the room (measured: wall at 1.99 m along az 0 vs camera at
+    # 2.13 m -> object 0 px behind the wall). A uniform clamped radius keeps
+    # the orbit rings coherent; the object stays fully in frame down to
+    # ~1.3x diag at fovy 45 deg, so require 1.5x diag with margin.
+    lookat_xy = ((mn + mx) / 2.0)[:2]
+    wall_r = min(cap.wall_distance_2d(model, env.sim.data, lookat_xy, az)
+                 for az in np.arange(0.0, 360.0, 7.5)) - 0.30
+    if radius > wall_r:
+        min_frame_r = max(1.5 * diag, 0.35)
+        assert wall_r >= min_frame_r, (
+            f"{tag}: wall-clamped orbit radius {wall_r:.2f} m cannot frame "
+            f"object diag {diag:.2f} m (needs >= {min_frame_r:.2f} m) — "
+            f"object too large for an interior orbit in this room")
+        radius = wall_r
     ring_drop = radius * math.sin(math.radians(20.0))  # -20 deg camera drop
-    dz = max(float(args.float_dz), ring_drop + 0.03 - half_z)
+    # the -20 deg ring camera sits at lookat_z - ring_drop with lookat_z =
+    # rest_center_z + dz; require camera_z >= table_top_z + 0.03, anchored on
+    # the ACTUAL table top — not the bounding-sphere aabb bottom, which dips
+    # ~4 cm below the surface for mesh geoms and left the ring cameras below
+    # the tabletop (measured: a table edge 4 cm in front of a below-top
+    # camera blanks the whole view).
+    rest_center_z = float(mn[2] + mx[2]) / 2.0
+    dz = max(float(args.float_dz),
+             ring_drop + 0.03 + ctx.table_top_z - rest_center_z)
 
     cap.set_flat_state(env, cap.float_object_state(grave_state, addr, joint_name, dz))
     # objects are always captured with the robot hidden (plan §5.1); in
@@ -403,8 +478,8 @@ def capture_object(ctx: TaskContext, joint_name: str) -> None:
         "body_pose": {"p": body_p.tolist(), "q_wxyz": body_q.tolist()},
         "object_geom_ids": obj_gids.tolist(),
         "capture_args": ctx.capture_args(
-            radius=float(radius), lookat=lookat.tolist(), float_dz=float(dz),
-            bbox_diag=diag),
+            radius=float(radius), radius_requested=float(radius_requested),
+            lookat=lookat.tolist(), float_dz=float(dz), bbox_diag=diag),
     }
     if masks_dir_name:
         extra["masks_dir"] = masks_dir_name
@@ -569,11 +644,30 @@ def capture_robot(ctx: TaskContext) -> None:
             i = len(views_meta)
             vtag = f"{tag} config {cfg_idx} view {i}"
             rgb, depth, seg, c2w = ctx.render_orbit_view(pose, vtag)
-            ctx.check_view(vtag, depth, seg, forbidden, "movable")
             n_robot = int(np.isin(seg, ctx.robot_gids).sum())
+            frac_close = float((depth < BG_POINT_BLANK_DEPTH_M).mean())
+            # room furniture/walls can pinch an orbit camera (measured: one
+            # config's az-12.5 deg eye landed INSIDE the living_room shelf
+            # mesh — 98% of pixels closer than 0.5 m, robot 0 px, while the
+            # neighboring config's eye 27 cm away was clear). Pull the camera
+            # in along the same ray until the view clears; direction coverage
+            # is preserved, the robot just fills more of the frame.
+            while (n_robot < MIN_ROBOT_PIXELS
+                   or frac_close > BG_POINT_BLANK_FRAC):
+                new_r = pose.distance * ROBOT_RADIUS_SHRINK
+                if new_r < ROBOT_MIN_RADIUS:
+                    break
+                pose = cap.OrbitPose(pose.lookat, new_r, pose.azimuth_deg,
+                                     pose.elevation_deg)
+                rgb, depth, seg, c2w = ctx.render_orbit_view(pose, vtag)
+                n_robot = int(np.isin(seg, ctx.robot_gids).sum())
+                frac_close = float((depth < BG_POINT_BLANK_DEPTH_M).mean())
+            ctx.check_view(vtag, depth, seg, forbidden, "movable")
             assert n_robot >= MIN_ROBOT_PIXELS, (
                 f"{vtag}: robot covers only {n_robot} px (< {MIN_ROBOT_PIXELS}) "
-                f"— occluded (radius {radius:.2f} m) or hidden by mistake")
+                f"even after pulling the camera in to {pose.distance:.2f} m "
+                f"(ring radius {radius:.2f} m) — occluded by room geometry or "
+                f"hidden by mistake")
             validator.try_view(env.sim.data, c2w, seg, depth, i,
                                pose.elevation_deg, tag)
             prefix = cap.write_view_files(out_dir, i, rgb, depth, seg)
